@@ -37,7 +37,7 @@ pkill -9 -f 'bin/px4'                2>/dev/null || true
 pkill -9 -f 'parameter_bridge'       2>/dev/null || true
 pkill -9 -f 'cartographer'           2>/dev/null || true
 pkill -9 -f 'static_transform_publisher' 2>/dev/null || true
-pkill -9 -f 'mavros'                 2>/dev/null || true
+pkill -9 -f 'mavros_node|mavros_router'                 2>/dev/null || true
 sleep 2
 
 cleanup() {
@@ -47,7 +47,7 @@ cleanup() {
   pkill -9 -f 'parameter_bridge' 2>/dev/null || true
   pkill -9 -f 'cartographer' 2>/dev/null || true
   pkill -9 -f 'static_transform_publisher' 2>/dev/null || true
-  pkill -9 -f 'mavros' 2>/dev/null || true
+  pkill -9 -f 'mavros_node|mavros_router' 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
