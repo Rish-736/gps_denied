@@ -16,7 +16,7 @@ builds (PX4-Autopilot, turtlebot3_ws) are **not** vendored here.
 | Cartographer 2D SLAM on TurtleBot3 (reference) | ✅ working |
 | Nav2 → drone velocity bridge (concept) | ✅ proven (x moves, z held in OFFBOARD) |
 | **Drone LiDAR in Gazebo (`/scan`)** | ✅ **fixed** — see gotcha below |
-| **Cartographer on the drone** | ✅ builds a map from real `/scan` data |
+| **Cartographer on the drone** | ✅ **confirmed** — map grows live in rviz while flying (OFFBOARD velocity) |
 | One-command launcher | ✅ `run_drone_slam.sh` |
 | Nav2 install | ⏳ in progress |
 | Frontier exploration → YOLO → tagging → FSM → GCS | ⬜ next |
@@ -65,6 +65,12 @@ commander takeoff          # wait until it is hovering stably
   This was misdiagnosed as a GPU/software-rendering bug; it never was.
 - **Cartographer needs `/clock` bridged** when `use_sim_time:=true`, or it silently drops
   every scan. The launch file bridges `/clock` alongside `/scan`.
+- **MAVROS `local_position tf.send` MUST stay `false`.** Cartographer already owns the whole
+  `map → odom → base_link` tree (`provide_odom_frame=true`, `published_frame=base_link`).
+  If MAVROS also publishes `odom → base_link` (tf.send:true), the two fight over the same
+  transform and the map blinks/jumps violently in rviz. Keep it false in px4_config.yaml.
+- **A 2D map only grows when the drone TRANSLATES.** Yawing in place just re-scans the same
+  walls — width/height stay fixed. Fly forward (OFFBOARD `linear.x`) to explore new area.
 - **Flight command order:** never send horizontal velocity before takeoff+hover, or the
   drone flips on the ground.
 - A flipped/tumbling drone makes the map "flash" in rviz — that's the sensor tumbling,
