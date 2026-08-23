@@ -11,7 +11,8 @@
 # usable), waits for the world, then launches every ROS node at once.
 # Ctrl-C in THIS terminal cleanly kills the whole stack.
 # =====================================================================
-set -uo pipefail
+# NOTE: no `set -u` — ROS 2's setup.bash references unbound vars by design.
+set -o pipefail
 
 WORLD="${WORLD:-walls}"
 USE_RVIZ="true"
