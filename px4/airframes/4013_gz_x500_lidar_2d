@@ -1,0 +1,71 @@
+#!/bin/sh
+#
+# @name Gazebo x500 lidar 2d
+#
+# @type Quadrotor
+#
+
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=x500_lidar_2d}
+
+. ${R}etc/init.d-posix/airframes/4001_gz_x500
+
+# =====================================================================
+# NIDAR AirMouse - GPS-denied external-vision + autonomous-companion config.
+# Baked in here so every boot is correctly configured (no manual param-setting).
+# See docs/px4_ekf2_vision_fusion_setup.md.
+# =====================================================================
+# Fuse Cartographer pose (arrives via MAVROS /mavros/vision_pose/pose) as the
+# position source, since there is no GPS indoors.
+#   EKF2_EV_CTRL bits: 0=horiz pos, 1=vert pos, 2=3D vel, 3=yaw.
+#   Use 9 (horiz + yaw). NOT vertical: our 2D-SLAM z is ~0, so fusing it would
+#   fight the real altitude the moment the drone climbs -> failsafe.
+param set EKF2_EV_CTRL 9
+param set EKF2_GPS_CTRL 0      # disable GPS fusion (no GPS at the venue)
+param set EKF2_HGT_REF 0       # height from baro (switch to 2=range once TF-Luna is added)
+
+# Autonomous companion: no RC, no GCS piloting. Disable PX4's built-in RC/GCS
+# failsafes (which would RTL and fight our mission); we own comm-loss/return
+# logic in the mission FSM. Also removes the "No connection to the GCS" arming
+# block. See mission rules Section 10.
+param set NAV_DLL_ACT 0        # no GCS-datalink-loss failsafe
+param set NAV_RCL_ACT 0        # no RC-loss failsafe (we have no RC)
+param set COM_RCL_EXCEPT 4     # allow OFFBOARD without RC
+
+# Indoor takeoff altitude. PX4 defaults to 2.5m, which is AT/ABOVE our maze wall
+# height (2.5m) and the real arena's 8ft (2.44m) ceiling. The LiDAR sits ~0.3m
+# above base_link, so a 2.5m takeoff puts the scan plane OVER the walls and the
+# map comes back empty -- looks exactly like the old all-.inf bug. Fly low.
+param set MIS_TAKEOFF_ALT 1.2
+
+# ---------------------------------------------------------------------------
+# INDOOR FLIGHT ENVELOPE. These were never set, so PX4 was flying the maze with
+# its stock OUTDOOR limits: 5 m/s cruise, 12 m/s max, 3 m/s^2 acceleration. The
+# follower commands a position ~0.6m ahead; with those gains PX4 lunges at it,
+# overshoots, and gets dragged back -- which is exactly the "moves for a second,
+# returns to the same spot" behaviour, and what put it into walls on turns.
+# Corridors here are 2.5m wide and the drone is ~0.6m across, so the whole
+# usable envelope is under 1 m/s. Speed is limited HERE, in the autopilot,
+# rather than in the follower: one owner for the flight envelope.
+#
+# Several of these sit AT their PX4-declared minimum (noted below). PX4 does not
+# clamp `param set` to the metadata range, but going under a documented minimum
+# is asking for trouble in code that assumes it, so each is pinned to the lowest
+# supported value instead. Actual cruise speed does not come from MPC_XY_CRUISE
+# anyway: an OFFBOARD position setpoint held `lookahead` metres ahead produces
+# roughly MPC_XY_P (0.95) * 0.6m ~= 0.57 m/s, with MPC_XY_VEL_MAX as the hard
+# ceiling. So the follower's lookahead is the real speed knob, and these
+# parameters exist to keep acceleration and yaw gentle.
+param set MPC_XY_VEL_MAX 1.5     # was 12.0 - absolute horizontal ceiling
+param set MPC_XY_CRUISE 3.0      # was 5.0  - PX4 minimum; VEL_MAX is what binds
+param set MPC_ACC_HOR 2.0        # was 3.0  - PX4 minimum (autonomous accel)
+param set MPC_ACC_HOR_MAX 2.0    # was 5.0  - PX4 minimum
+param set MPC_JERK_AUTO 2.0      # was 4.0  - gentler onset, less scan skew
+param set MPC_XY_ERR_MAX 1.0     # was 2.0  - cap how far ahead the setpoint pulls
+param set MPC_YAWRAUTO_MAX 30.0  # was 60.0 - slow yaw keeps scan matching happy
+
+# Vertical: climb gently so the 2D scan plane stays level during takeoff.
+param set MPC_TKO_SPEED 1.0      # was 1.5  - PX4 minimum
+param set MPC_Z_VEL_MAX_UP 0.8   # was 3.0
+param set MPC_Z_VEL_MAX_DN 0.6   # was 1.5
+param set MPC_ACC_UP_MAX 2.0     # was 4.0  - PX4 minimum
+param set MPC_ACC_DOWN_MAX 2.0   # was 3.0  - PX4 minimum

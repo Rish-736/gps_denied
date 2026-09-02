@@ -14,12 +14,17 @@ builds (PX4-Autopilot, turtlebot3_ws) are **not** vendored here.
 |---|---|
 | ROS 2 Jazzy + PX4 SITL + MAVROS | ✅ working |
 | Cartographer 2D SLAM on TurtleBot3 (reference) | ✅ working |
-| Nav2 → drone velocity bridge (concept) | ✅ proven (x moves, z held in OFFBOARD) |
 | **Drone LiDAR in Gazebo (`/scan`)** | ✅ **fixed** — see gotcha below |
-| **Cartographer on the drone** | ✅ **confirmed** — map grows live in rviz while flying (OFFBOARD velocity) |
+| **Cartographer on the drone** | ✅ **confirmed** — map grows live in rviz while flying |
+| PX4 EKF2 external-vision fusion (SLAM pose → PX4) | ✅ working (`vision_pose_bridge`) |
+| Auto arm → OFFBOARD → climb (no `pxh>` typing) | ✅ `auto_takeoff.py` |
+| Nav2 planner + frontier exploration + position follower | ✅ autonomous maze flight |
 | One-command launcher | ✅ `run_drone_slam.sh` |
-| Nav2 install | ⏳ in progress |
-| Frontier exploration → YOLO → tagging → FSM → GCS | ⬜ next |
+| YOLO survivor detection → tagging → FSM → GCS | ⬜ next |
+
+> **Known-good as of this branch:** the drone auto-takes-off, explores the maze
+> by frontier, and returns to the entry/exit point. Speeds are tuned slow for
+> tight corridors. See `docs/` for the tuning rationale.
 
 ---
 
@@ -27,12 +32,40 @@ builds (PX4-Autopilot, turtlebot3_ws) are **not** vendored here.
 
 ```
 src/drone_cartographer/
-  config/drone_2d.lua          # Cartographer config tuned for the drone frames
-  launch/drone_slam.launch.py  # starts all ROS nodes at once
-  rviz/drone_slam.rviz         # rviz preset (map frame, /map, /scan)
-run_drone_slam.sh              # one command: sim + SLAM + rviz
-docs/                          # full technical handover doc
+  config/drone_2d.lua              # Cartographer config tuned for the drone frames
+  config/nav2_drone.yaml           # Nav2 planner + costmaps (indoor-tuned)
+  launch/drone_slam.launch.py      # SLAM layer: bridges, TF, Cartographer, rviz
+  launch/drone_explore.launch.py   # autonomy layer: planner + explorer + follower
+  scripts/
+    vision_pose_bridge.py          # Cartographer pose -> PX4 EKF2 (map->base_link TF)
+    auto_takeoff.py                # arm -> OFFBOARD -> climb, no pxh> typing
+    frontier_explorer.py           # picks frontiers, asks planner for a path
+    path_follower_position.py      # flies the path with PX4 POSITION setpoints
+    generate_maze_world.py         # generates the test maze SDF worlds
+run_drone_slam.sh                  # one command: sim + SLAM + rviz
+px4/airframes/                     # PX4 airframe (install into ~/PX4-Autopilot, see px4/README.md)
+docs/                              # technical handover + tuning rationale
 ```
+
+### Architecture (autonomous flight)
+
+Two layers so SLAM can be debugged without the autonomy stack on top:
+
+```
+run_drone_slam.sh  ->  PX4+Gazebo (sim)  +  drone_slam.launch.py (SLAM)
+                                              |  publishes /scan, /map, map->odom->base_link TF
+drone_explore.launch.py (autonomy)
+   vision_pose_bridge     : map->base_link TF  -> PX4 EKF2 (so PX4 knows where it is)
+   auto_takeoff           : arm -> OFFBOARD -> climb to altitude
+   frontier_explorer      : /map -> pick frontier -> Nav2 planner -> /planned_path
+   path_follower_position : /planned_path -> PX4 POSITION setpoints
+```
+
+We use **only Nav2's planner**, not its controller — the MPPI velocity
+controller stalled the drone, so control is done with position setpoints. All
+path reasoning happens in the `map` frame and is transformed into PX4's local
+frame before publishing (mixing those two frames was what sent the drone out
+of the maze).
 
 ## How to run the drone SLAM sim (one command)
 
@@ -46,7 +79,28 @@ Opens PX4+Gazebo in its own konsole (the `pxh>` console stays usable), waits for
 world, then launches the bridges, static TF, Cartographer, occupancy grid, and rviz.
 **Ctrl-C** in the launching terminal cleanly tears the whole stack down.
 
-To fly (after `--mavros`), in the `pxh>` console — **in this order**, or the drone tips over:
+## Fully autonomous maze run (no manual flying)
+
+First-time setup: install the PX4 airframe (see [`px4/README.md`](px4/README.md)),
+then two commands:
+
+```bash
+# terminal 1 — sim + SLAM + MAVROS
+WORLD=nidar_maze_wide ./run_drone_slam.sh --mavros
+
+# terminal 2 — autonomy: auto-takeoff, explore, return to entry
+source /opt/ros/jazzy/setup.bash
+ros2 launch src/drone_cartographer/launch/drone_explore.launch.py
+```
+
+The drone arms, climbs, explores the maze by frontier, and flies back to the
+entry/exit point on its own. For the tighter `nidar_maze` world, pass its arena
+bounds (see the launch file header). `lookahead:=0.4` slows it further for
+sharp turns.
+
+### Manual flying (optional, `--mavros`)
+
+To fly by hand in the `pxh>` console — **in this order**, or the drone tips over:
 ```
 commander arm
 commander takeoff          # wait until it is hovering stably

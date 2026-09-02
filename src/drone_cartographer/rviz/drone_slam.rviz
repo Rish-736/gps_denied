@@ -59,10 +59,54 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /scan
       Value: true
+    # Live drone position: base_link is the drone body, so this shows exactly
+    # where SLAM thinks the drone is, moving in real time.
     - Class: rviz_default_plugins/TF
-      Enabled: false
+      Enabled: true
       Name: TF
-      Value: false
+      Frame Timeout: 15
+      Marker Scale: 1.2
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+      Tree:
+        {}
+      Value: true
+    # Cartographer's own trajectory - the path the drone has flown, drawn on
+    # the map. Best single view of "where has it been / where is it now".
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: SLAM Trajectory
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /trajectory_node_list
+      Value: true
+    # PX4's own fused position estimate (what the flight controller believes),
+    # so you can eyeball SLAM vs PX4 agreement at a glance.
+    - Alpha: 1
+      Axes Length: 0.6
+      Axes Radius: 0.08
+      Class: rviz_default_plugins/Pose
+      Color: 255; 25; 0
+      Enabled: true
+      Head Length: 0.2
+      Head Radius: 0.1
+      Name: Drone Pose (PX4)
+      Shaft Length: 0.6
+      Shaft Radius: 0.04
+      Shape: Axes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /mavros/local_position/pose
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

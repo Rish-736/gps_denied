@@ -46,16 +46,51 @@ options = {
 
 MAP_BUILDER.use_trajectory_builder_2d = true
 
-TRAJECTORY_BUILDER_2D.min_range = 0.12
-TRAJECTORY_BUILDER_2D.max_range = 20.
-TRAJECTORY_BUILDER_2D.missing_data_ray_length = 15.
+TRAJECTORY_BUILDER_2D.min_range = 0.15
+-- Maze is 13.5m across and the real RPLidar C1 we're buying does 12m (6m on
+-- dark surfaces). 20m just accepted long noisy returns that won't exist on the
+-- real sensor; 10m keeps sim honest about hardware.
+TRAJECTORY_BUILDER_2D.max_range = 10.
+-- WAS 15m: every ray that returned no hit carved 15m of FREE space, which in a
+-- 13.5m maze punches straight through walls and erases them -> washed-out,
+-- unclear walls. 5m (the Cartographer default) keeps free-space carving local.
+TRAJECTORY_BUILDER_2D.missing_data_ray_length = 5.
+-- OFF (2026-09-02). This was toggled on twice to fix an apparent "map drift at
+-- turns" -- but that diagnosis was WRONG. The map wasn't drifting: the drone was
+-- flying OUT of the maze through the entry gap and legitimately mapping the open
+-- ground outside, because the frontier explorer had no arena bounds. That's now
+-- fixed there. So the IMU was solving a problem that didn't exist, while
+-- historically correlating with EKF instability. Back to the config that flew
+-- the maze cleanly.
+--
+-- Worth revisiting ONLY if real turn-drift shows up once exploration is properly
+-- bounded -- and then as an isolated change, verifying const_pos_mode stays
+-- false. (vision_pose_bridge's pose-jump guard stays regardless; it's good
+-- protection either way.)
 TRAJECTORY_BUILDER_2D.use_imu_data = false
-TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true 
-TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(0.1)
+TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
+
+-- Motion filter: these were TurtleBot3 values. A wheeled robot sits perfectly
+-- still, so a 0.1 DEGREE threshold was fine there. A hovering drone always
+-- jitters more than 0.1deg, so EVERY scan became a new node -> node count
+-- explodes -> the pose graph re-optimises constantly -> all submaps shift ->
+-- the map visibly jumps/blinks. Back to Cartographer defaults, which suit a
+-- drone: insert a node on 1deg of rotation, 0.2m of travel, or every 5s.
+TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(1.0)
+TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.2
+TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 5.
+
+-- Slightly larger submaps than the default 90: fewer submap boundaries in a
+-- small arena means fewer seams and a steadier map.
+TRAJECTORY_BUILDER_2D.submaps.num_range_data = 120
 
 POSE_GRAPH.constraint_builder.min_score = 0.65
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.7
 
--- POSE_GRAPH.optimize_every_n_nodes = 0
+-- Every optimisation pass shifts submaps, which is what you SEE as the map
+-- jumping. With the motion filter fixed above, nodes accumulate at a sane rate,
+-- so the default cadence is no longer constant. Raise this if it still jumps
+-- too often (costs some drift correction); lower it for tighter accuracy.
+POSE_GRAPH.optimize_every_n_nodes = 90
 
 return options

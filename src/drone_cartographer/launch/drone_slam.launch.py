@@ -21,7 +21,7 @@ Run standalone:
 """
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, IncludeLaunchDescription, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
 from launch.launch_description_sources import AnyLaunchDescriptionSource
@@ -31,6 +31,7 @@ from ament_index_python.packages import get_package_share_directory
 PKG_DIR = os.path.expanduser('~/nidar_ws/src/drone_cartographer')
 CONFIG_DIR = os.path.join(PKG_DIR, 'config')
 RVIZ_CONFIG = os.path.join(PKG_DIR, 'rviz', 'drone_slam.rviz')
+SCRIPTS_DIR = os.path.join(PKG_DIR, 'scripts')
 
 
 def launch_setup(context, *args, **kwargs):
@@ -40,6 +41,8 @@ def launch_setup(context, *args, **kwargs):
 
     scan_gz = (f'/world/{world}/model/x500_lidar_2d_0/link/link'
                f'/sensor/lidar_2d_v2/scan')
+    imu_gz = (f'/world/{world}/model/x500_lidar_2d_0/link/base_link'
+              f'/sensor/imu_sensor/imu')
 
     nodes = [
         # gz -> /scan
@@ -48,6 +51,25 @@ def launch_setup(context, *args, **kwargs):
             name='lidar_bridge',
             arguments=[f'{scan_gz}@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan'],
             remappings=[(scan_gz, '/scan')],
+            output='screen',
+        ),
+        # gz -> /imu  (Cartographer motion prior)
+        #
+        # TurtleBot3 fed Cartographer wheel odometry, which is why its map was
+        # steady. The drone has no wheels, so Cartographer was estimating motion
+        # from scan-matching alone -> every correction jumped base_link -> the
+        # map "blinks". The IMU gives it that missing motion prior plus gravity
+        # alignment (important: a drone tilts to move, which skews a 2D scan).
+        #
+        # Bridged from Gazebo rather than MAVROS on purpose: gz stamps sim time
+        # (matching /scan, so no time-domain conflict) and it's a raw sensor, so
+        # it can't form a feedback loop with vision_pose_bridge the way PX4's
+        # own EKF2 odometry would.
+        Node(
+            package='ros_gz_bridge', executable='parameter_bridge',
+            name='imu_bridge',
+            arguments=[f'{imu_gz}@sensor_msgs/msg/Imu[gz.msgs.IMU'],
+            remappings=[(imu_gz, '/imu')],
             output='screen',
         ),
         # gz -> /clock  (sim time)
@@ -103,6 +125,18 @@ def launch_setup(context, *args, **kwargs):
             condition=IfCondition(use_mavros),
         )
     )
+
+    # Safety chain (only meaningful once MAVROS is up): feed PX4 a real
+    # position (vision_pose_bridge), watch it against a local geofence
+    # (geofence_monitor), and run the mission timer/entry-point memory
+    # (mission_fsm). See docs/mission_rules_crucial_risks.md #1/#3/#5/#6.
+    for script in ('vision_pose_bridge.py', 'geofence_monitor.py', 'mission_fsm.py'):
+        nodes.append(ExecuteProcess(
+            cmd=['python3', os.path.join(SCRIPTS_DIR, script)],
+            name=script,
+            output='screen',
+            condition=IfCondition(use_mavros),
+        ))
     return nodes
 
 
