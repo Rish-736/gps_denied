@@ -52,18 +52,29 @@ def generate_launch_description():
                           'node_names': NAV2_NODES}]),
     ]
 
+    arena = [
+        '-p', ['arena_min_x:=', LaunchConfiguration('arena_min_x')],
+        '-p', ['arena_max_x:=', LaunchConfiguration('arena_max_x')],
+        '-p', ['arena_min_y:=', LaunchConfiguration('arena_min_y')],
+        '-p', ['arena_max_y:=', LaunchConfiguration('arena_max_y')],
+    ]
+
     explorer_and_follower = [
-        # Scores frontiers (distance vs information gain, with hysteresis),
-        # asks the planner for a path to the winner, publishes it on
-        # /planned_path. Arena bounds keep goals inside the maze -- without
-        # them it targets the open field visible through the entry gap.
+        # Coverage grid: tracks which arena cells the camera has actually
+        # searched (not just mapped) and publishes /coverage_grid. The explorer
+        # flies to unsearched cells until none remain -> full-arena search
+        # guarantee. cell_size is a parameter (the brief doesn't fix it).
+        ExecuteProcess(
+            cmd=['python3', os.path.join(SCRIPTS, 'coverage_tracker.py'),
+                 '--ros-args', *arena,
+                 '-p', ['cell_size:=', LaunchConfiguration('cell_size')]],
+            name='coverage_tracker', output='screen'),
+        # Scores frontiers (distance vs information gain, with hysteresis) AND
+        # unsearched coverage cells, asks the planner for a path to the winner,
+        # publishes it on /planned_path. Arena bounds keep goals inside the maze.
         ExecuteProcess(
             cmd=['python3', os.path.join(SCRIPTS, 'frontier_explorer.py'),
-                 '--ros-args',
-                 '-p', ['arena_min_x:=', LaunchConfiguration('arena_min_x')],
-                 '-p', ['arena_max_x:=', LaunchConfiguration('arena_max_x')],
-                 '-p', ['arena_min_y:=', LaunchConfiguration('arena_min_y')],
-                 '-p', ['arena_max_y:=', LaunchConfiguration('arena_max_y')]],
+                 '--ros-args', *arena],
             name='frontier_explorer', output='screen'),
         # Flies /planned_path with POSITION setpoints (also holds position at
         # altitude when idle -> serves as the OFFBOARD setpoint stream).
@@ -89,9 +100,10 @@ def generate_launch_description():
                               description='Automatically arm, take off and enter OFFBOARD'),
         DeclareLaunchArgument('altitude', default_value='1.2',
                               description='Flight altitude (must stay under the 2.5m walls)'),
-        DeclareLaunchArgument('lookahead', default_value='0.6',
+        DeclareLaunchArgument('lookahead', default_value='0.4',
                               description='Carrot distance ahead on the path; '
-                                          'sets cruise speed (~0.95 * lookahead m/s)'),
+                                          'sets cruise speed (~0.95 * lookahead m/s). '
+                                          '0.4 -> ~0.38 m/s: slow & smooth keeps SLAM locked'),
         # Arena bounds, measured from the world SDF wall centre lines. Defaults
         # are nidar_maze_wide, inset slightly so goals sit off the walls.
         #   nidar_maze_wide  x[-8.75, 6.25]  y[-1.25, 13.75]
@@ -102,6 +114,10 @@ def generate_launch_description():
         DeclareLaunchArgument('arena_max_x', default_value='6.0'),
         DeclareLaunchArgument('arena_min_y', default_value='-1.0'),
         DeclareLaunchArgument('arena_max_y', default_value='13.5'),
+        # Coverage/survivor grid cell size. The brief does NOT fix this -- set it
+        # to whatever the organizers confirm for the real arena.
+        DeclareLaunchArgument('cell_size', default_value='1.0',
+                              description='Coverage & survivor-report grid cell size (m)'),
         *nav2,
         *explorer_and_follower,
     ])

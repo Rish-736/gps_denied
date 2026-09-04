@@ -61,10 +61,13 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import (QoSProfile, ReliabilityPolicy, HistoryPolicy,
+                       DurabilityPolicy)
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
+from mavros_msgs.srv import SetMode
 from tf2_ros import Buffer, TransformListener, TransformException
 
 
@@ -100,6 +103,40 @@ class PathFollowerPosition(Node):
         # Hold position if Cartographer's pose goes stale -- never keep flying
         # on a frozen estimate.
         self.declare_parameter('pose_timeout_sec', 1.0)
+        # Reactive LiDAR brake -- the wall safety net. It reads raw /scan in the
+        # body frame, so it works even when SLAM/localisation is wrong (exactly
+        # the case that steers a "valid" planned path into a wall). If the
+        # closest return inside a cone around the travel direction is nearer than
+        # brake_distance, the drone holds instead of pushing forward. A separate,
+        # larger release distance gives hysteresis: without it the brake chattered
+        # on/off every ~50 ms near a wall, jerking the setpoint and destabilising
+        # the aircraft (this made a real flight diverge).
+        self.declare_parameter('brake_distance', 0.55)
+        self.declare_parameter('brake_release_distance', 0.85)
+        self.declare_parameter('brake_cone_deg', 50.0)
+        # WALL REPULSION -- stops the drone's ARMS clipping a wall. The x500 is
+        # ~0.6m across (arms/props reach ~0.3m from centre), but the brake above
+        # treats the drone as a point and only looks forward, so a wall beside
+        # the aircraft -- during a turn or a cut corner -- was never seen and an
+        # arm hit it. This adds a 360-degree potential field: every /scan return
+        # closer than influence_radius pushes the setpoint away from it. In a
+        # corridor the two walls cancel, so the drone self-centres; at a corner
+        # the inside wall pushes it wide so the arm clears. robot_radius is the
+        # prop-tip radius the field must protect.
+        self.declare_parameter('robot_radius', 0.35)
+        self.declare_parameter('repulsion_influence', 0.9)
+        self.declare_parameter('repulsion_gain', 0.8)
+        self.declare_parameter('repulsion_max', 0.6)
+        # Localisation-divergence failsafe: if the estimated map<->PX4-local
+        # offset exceeds this (after it has had time to settle), SLAM/EKF have
+        # diverged -- LAND. Catches the slow-drift runaway the speed detector in
+        # vision_pose_bridge can miss.
+        self.declare_parameter('max_offset_m', 3.0)
+        # Safe recovery: if SLAM stays lost this long, stop hovering blind and
+        # LAND (PX4 AUTO.LAND descends on baro, needs no position estimate). This
+        # is what makes the drone "come down safely" instead of flying off when
+        # localisation is gone.
+        self.declare_parameter('land_after_slam_lost_sec', 6.0)
 
         self.target_alt = self.get_parameter('target_altitude').value
         self.lookahead = self.get_parameter('lookahead').value
@@ -108,7 +145,18 @@ class PathFollowerPosition(Node):
         self.body_frame = self.get_parameter('body_frame').value
         self.yaw_min_dist = self.get_parameter('yaw_min_distance').value
         self.pose_timeout = self.get_parameter('pose_timeout_sec').value
+        self.brake_dist = self.get_parameter('brake_distance').value
+        self.brake_release = self.get_parameter('brake_release_distance').value
+        self.brake_cone = math.radians(self.get_parameter('brake_cone_deg').value)
+        self.robot_radius = self.get_parameter('robot_radius').value
+        self.repulsion_influence = self.get_parameter('repulsion_influence').value
+        self.repulsion_gain = self.get_parameter('repulsion_gain').value
+        self.repulsion_max = self.get_parameter('repulsion_max').value
+        self.max_offset = self.get_parameter('max_offset_m').value
+        self.land_after = self.get_parameter('land_after_slam_lost_sec').value
         rate_hz = self.get_parameter('rate_hz').value
+        # low-pass state for the repulsion vector (avoid setpoint jitter)
+        self.rep_x = self.rep_y = 0.0
 
         # --- pose in the MAP frame (Cartographer, same frame as the path) ---
         self.mx = self.my = self.myaw = 0.0
@@ -134,19 +182,36 @@ class PathFollowerPosition(Node):
         self.airborne = False
         self.hold_xy = None     # latched hold point (NOT the live pose)
 
+        # SLAM health (from vision_pose_bridge). Assume OK until told otherwise
+        # so a late-joining latched publisher doesn't force a spurious hover.
+        self.slam_ok = True
+        self.slam_lost_since = None     # wall-clock when SLAM first went bad
+        self.landing = False            # latched once we commit to LAND
+        # Reactive brake state: nearest obstacle in a body-frame cone, and the
+        # cone the /scan spans, filled from the first scan.
+        self.scan = None
+        self.brake_active = False
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST, depth=5)
+        latched = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             history=HistoryPolicy.KEEP_LAST, depth=1)
         self.create_subscription(Path, '/planned_path', self._on_path, 10)
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',
                                  self._on_local, sensor_qos)
+        self.create_subscription(LaserScan, '/scan', self._on_scan, sensor_qos)
+        self.create_subscription(Bool, '/slam_ok', self._on_slam_ok, latched)
         self.sp_pub = self.create_publisher(
             PoseStamped, '/mavros/setpoint_position/local', 10)
         self.reached_pub = self.create_publisher(Bool, '/path_follower/reached', 10)
         # Published purely for RViz: shows exactly what the drone is chasing.
         self.carrot_pub = self.create_publisher(PoseStamped, '/follower/carrot', 5)
+        # For the safe-recovery LAND when SLAM is lost for good.
+        self.mode_cli = self.create_client(SetMode, '/mavros/set_mode')
 
         self._align_log = 0
         self.create_timer(1.0 / rate_hz, self._tick)
@@ -181,6 +246,109 @@ class PathFollowerPosition(Node):
             self.airborne = True
             self.get_logger().info(
                 f'Reached {self.lz:.2f}m -> path following enabled')
+
+    def _on_scan(self, msg: LaserScan):
+        self.scan = msg
+
+    def _on_slam_ok(self, msg: Bool):
+        if msg.data != self.slam_ok:
+            self.slam_ok = msg.data
+            if not msg.data:
+                self.slam_lost_since = self.get_clock().now()
+                self.get_logger().error(
+                    f'SLAM lost -> HOVERING; will LAND if not recovered in '
+                    f'{self.land_after:.0f}s')
+            else:
+                self.slam_lost_since = None
+                self.get_logger().info('SLAM recovered -> resuming path following')
+
+    def _nearest_ahead(self, body_bearing):
+        """Closest /scan return within a cone around body_bearing (the travel
+        direction in the BODY frame, 0 = straight ahead). Works on raw ranges,
+        so it is immune to any map/localisation error -- the point of the brake.
+        Returns +inf if nothing is in range."""
+        scan = self.scan
+        if scan is None:
+            return float('inf')
+        n = len(scan.ranges)
+        if n == 0:
+            return float('inf')
+        half = self.brake_cone / 2.0
+        amin, ainc = scan.angle_min, scan.angle_increment
+        nearest = float('inf')
+        for i in range(n):
+            r = scan.ranges[i]
+            if math.isinf(r) or math.isnan(r):
+                continue
+            if not (scan.range_min < r < scan.range_max):
+                continue
+            ang = amin + i * ainc
+            if abs(wrap(ang - body_bearing)) <= half and r < nearest:
+                nearest = r
+        return nearest
+
+    def _brake_check(self, body_bearing):
+        """Hysteretic brake: engage below brake_distance, release only once past
+        brake_release_distance. The gap stops the on/off chatter that jerked the
+        setpoint and destabilised the aircraft."""
+        nearest = self._nearest_ahead(body_bearing)
+        if self.brake_active:
+            if nearest > self.brake_release:
+                self.brake_active = False
+                self.get_logger().info(
+                    f'Path ahead clear ({nearest:.2f}m) -> resuming')
+        else:
+            if nearest < self.brake_dist:
+                self.brake_active = True
+                self.get_logger().warn(
+                    f'Obstacle {nearest:.2f}m ahead -> braking (hold)')
+        return self.brake_active
+
+    def _repulsion_map(self):
+        """360-degree wall-repulsion nudge, returned in the MAP frame.
+
+        Every /scan return closer than influence pushes the setpoint directly
+        away from it, weighted by how close it is (measured from the prop tips,
+        i.e. r - robot_radius). Summed over all returns:
+          * in a straight corridor the two side walls cancel -> the drone
+            self-centres, keeping the arms away from both walls;
+          * at a corner or when off-centre, the near wall wins -> the setpoint
+            is pushed wide so an arm can't clip it while turning.
+        Low-pass filtered so the setpoint doesn't jitter. Immune to
+        localisation error because it works on raw body-frame ranges."""
+        scan = self.scan
+        rx = ry = 0.0
+        if scan is not None and len(scan.ranges):
+            amin, ainc = scan.angle_min, scan.angle_increment
+            infl = self.repulsion_influence
+            for i, r in enumerate(scan.ranges):
+                if math.isinf(r) or math.isnan(r):
+                    continue
+                if not (scan.range_min < r < scan.range_max):
+                    continue
+                clearance = r - self.robot_radius      # distance from prop tips
+                if clearance >= infl:
+                    continue
+                ang = amin + i * ainc
+                w = (infl - clearance) / infl          # 0..1, grows as it nears
+                w = max(0.0, w) ** 2                    # emphasise very close walls
+                rx -= math.cos(ang) * w                 # push AWAY from the return
+                ry -= math.sin(ang) * w
+        # scale + cap the raw (body-frame) push
+        mag = math.hypot(rx, ry)
+        if mag > 1e-3:
+            capped = min(mag * self.repulsion_gain, self.repulsion_max)
+            rx, ry = rx / mag * capped, ry / mag * capped
+        else:
+            rx = ry = 0.0
+        # low-pass to avoid jitter
+        a = 0.4
+        self.rep_x += a * (rx - self.rep_x)
+        self.rep_y += a * (ry - self.rep_y)
+        # body -> map frame (scan angles are body-frame; carrot is map-frame)
+        c, s = math.cos(self.myaw), math.sin(self.myaw)
+        return (c * self.rep_x - s * self.rep_y,
+                s * self.rep_x + c * self.rep_y)
 
     def _read_map_pose(self):
         """Drone pose in the MAP frame, straight from Cartographer's TF.
@@ -287,29 +455,30 @@ class PathFollowerPosition(Node):
             yaw = math.atan2(ty - self.my, tx - self.mx)
         return tx, ty, yaw
 
-    def _tick(self):
-        self._read_map_pose()
-        if not (self.map_ok and self.local_ok):
-            return
-        self._update_transform()
-
-        # Stale SLAM pose -> stop moving rather than fly blind on a frozen estimate.
-        stale = (self.get_clock().now() - self.last_map_time).nanoseconds / 1e9
-        if stale > self.pose_timeout:
-            tx, ty, tyaw = self._hold()
+    def _commit_land(self):
+        """SLAM is gone for good -> ask PX4 to land where it is. AUTO.LAND
+        descends on baro and needs no position estimate, so it works even with a
+        diverged EKF. Latched so we only fire once."""
+        self.landing = True
+        self.get_logger().error(
+            f'SLAM not recovered in {self.land_after:.0f}s -> commanding AUTO.LAND '
+            '(safe descent)')
+        if self.mode_cli.service_is_ready():
+            req = SetMode.Request()
+            req.custom_mode = 'AUTO.LAND'
+            self.mode_cli.call_async(req)
         else:
-            tx, ty, tyaw = self._carrot()
+            self.get_logger().warn('set_mode service not ready; retrying LAND')
+            self.landing = False    # allow another attempt next tick
 
-        # Everything above was reasoned in MAP. Convert to PX4's local frame,
-        # which is what the setpoint topic is actually interpreted in.
-        sx, sy, syaw = self._map_to_local(tx, ty, tyaw)
-
-        qx, qy, qz, qw = yaw_to_quat(syaw)
+    def _publish_setpoint(self, x, y, yaw, frame):
+        """Publish a local-frame position setpoint. frame is just for the log."""
+        qx, qy, qz, qw = yaw_to_quat(yaw)
         sp = PoseStamped()
         sp.header.stamp = self.get_clock().now().to_msg()
         sp.header.frame_id = 'map'
-        sp.pose.position.x = sx
-        sp.pose.position.y = sy
+        sp.pose.position.x = x
+        sp.pose.position.y = y
         sp.pose.position.z = self.target_alt
         sp.pose.orientation.x = qx
         sp.pose.orientation.y = qy
@@ -317,8 +486,71 @@ class PathFollowerPosition(Node):
         sp.pose.orientation.w = qw
         self.sp_pub.publish(sp)
 
+    def _tick(self):
+        self._read_map_pose()
+        if not self.local_ok:
+            return
+
+        # SLAM-LOSS FAILSAFE. When Cartographer loses tracking, both the map
+        # pose AND the map->local transform become unreliable (this is what
+        # diverged the EKF and crashed the drone). So hover using PX4's OWN local
+        # position directly -- no map, no transform. PX4 coasts on its IMU and
+        # holds station until SLAM recovers. If it does NOT recover within
+        # land_after seconds, stop hovering blind and LAND -- coming down safely
+        # beats drifting off lost. /slam_ok comes from vision_pose_bridge, which
+        # catches the frozen AND diverging cases the follower cannot.
+        if (not self.slam_ok) or (not self.map_ok):
+            if self.slam_lost_since is not None:
+                lost_for = (self.get_clock().now()
+                            - self.slam_lost_since).nanoseconds / 1e9
+                if lost_for > self.land_after and not self.landing:
+                    self._commit_land()
+            if not self.landing:
+                self._publish_setpoint(self.lx, self.ly, self.lyaw, 'local-hover')
+            return
+        if self.landing:
+            return                  # already committed to LAND; PX4 owns it now
+
+        self._update_transform()
+
+        # DIVERGENCE FAILSAFE. A large, settled map<->PX4-local offset means SLAM
+        # or the EKF has run away (the slow-drift case the speed detector misses).
+        # Once airborne, treat that as lost -> LAND. self.t_init guards against
+        # tripping before the transform has had a chance to settle.
+        if self.airborne and self.t_init and not self.landing:
+            if math.hypot(self.t_x, self.t_y) > self.max_offset:
+                self.get_logger().error(
+                    f'map<->local offset {math.hypot(self.t_x, self.t_y):.1f}m '
+                    '-> localisation diverged, LANDING')
+                self._commit_land()
+                return
+
+        tx, ty, tyaw = self._carrot()
+
+        # REACTIVE LiDAR BRAKE (hysteretic). If flying toward a too-close return,
+        # hold instead of pushing into it. Uses raw /scan in the body frame, so
+        # it protects even when the map/localisation is wrong.
+        moving = self.airborne and self.path and \
+            math.hypot(tx - self.mx, ty - self.my) > 0.05
+        if moving:
+            body_bearing = wrap(math.atan2(ty - self.my, tx - self.mx) - self.myaw)
+            if self._brake_check(body_bearing):
+                tx, ty, tyaw = self._hold()
+
+        # WALL REPULSION. Always nudge the setpoint away from nearby walls (even
+        # while holding/braking, so a hold near a wall still eases off it). This
+        # is what keeps the arms from clipping a wall on a turn.
+        if self.airborne:
+            rmx, rmy = self._repulsion_map()
+            tx += rmx
+            ty += rmy
+
+        # Reasoned in MAP; convert to PX4's local frame for the setpoint topic.
+        sx, sy, syaw = self._map_to_local(tx, ty, tyaw)
+        self._publish_setpoint(sx, sy, syaw, 'map->local')
+
         carrot = PoseStamped()
-        carrot.header.stamp = sp.header.stamp
+        carrot.header.stamp = self.get_clock().now().to_msg()
         carrot.header.frame_id = self.map_frame
         carrot.pose.position.x = tx
         carrot.pose.position.y = ty
@@ -335,7 +567,7 @@ class PathFollowerPosition(Node):
                 f'map=({self.mx:.2f},{self.my:.2f}) '
                 f'px4_local=({self.lx:.2f},{self.ly:.2f}) '
                 f'offset={off:.2f}m yaw={math.degrees(self.t_yaw):+.1f}deg '
-                f'| prog {self.prog}/{len(self.path)}')
+                f'| prog {self.prog}/{len(self.path)} brake={self.brake_active}')
 
 
 def main():

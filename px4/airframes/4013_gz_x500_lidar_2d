@@ -55,13 +55,18 @@ param set MIS_TAKEOFF_ALT 1.2
 # roughly MPC_XY_P (0.95) * 0.6m ~= 0.57 m/s, with MPC_XY_VEL_MAX as the hard
 # ceiling. So the follower's lookahead is the real speed knob, and these
 # parameters exist to keep acceleration and yaw gentle.
-param set MPC_XY_VEL_MAX 1.5     # was 12.0 - absolute horizontal ceiling
+# SLOWED FURTHER (2026-09-03). Flight tests showed SLAM holds for ~90s then
+# diverges during fast cross-maze traverses -- fast motion skews the 2D scan and
+# breaks scan matching. The cure is slow, smooth flight, so the ceiling is now
+# 1.0 m/s and yaw is capped tighter. Actual cruise is set by the follower's
+# lookahead (~0.4m -> ~0.38 m/s); this is just the hard ceiling for bursts.
+param set MPC_XY_VEL_MAX 1.0     # was 12.0 - absolute horizontal ceiling
 param set MPC_XY_CRUISE 3.0      # was 5.0  - PX4 minimum; VEL_MAX is what binds
 param set MPC_ACC_HOR 2.0        # was 3.0  - PX4 minimum (autonomous accel)
 param set MPC_ACC_HOR_MAX 2.0    # was 5.0  - PX4 minimum
 param set MPC_JERK_AUTO 2.0      # was 4.0  - gentler onset, less scan skew
-param set MPC_XY_ERR_MAX 1.0     # was 2.0  - cap how far ahead the setpoint pulls
-param set MPC_YAWRAUTO_MAX 30.0  # was 60.0 - slow yaw keeps scan matching happy
+param set MPC_XY_ERR_MAX 0.6     # was 2.0  - cap how far ahead the setpoint pulls
+param set MPC_YAWRAUTO_MAX 20.0  # was 60.0 - slow yaw keeps scan matching happy
 
 # Vertical: climb gently so the 2D scan plane stays level during takeoff.
 param set MPC_TKO_SPEED 1.0      # was 1.5  - PX4 minimum
@@ -69,3 +74,25 @@ param set MPC_Z_VEL_MAX_UP 0.8   # was 3.0
 param set MPC_Z_VEL_MAX_DN 0.6   # was 1.5
 param set MPC_ACC_UP_MAX 2.0     # was 4.0  - PX4 minimum
 param set MPC_ACC_DOWN_MAX 2.0   # was 3.0  - PX4 minimum
+
+# ---------------------------------------------------------------------------
+# ALTITUDE STABILITY. In the first full flight the drone bobbed between 1.4m and
+# 0.13m (nearly the floor) whenever it chased a waypoint: to accelerate
+# horizontally a multirotor TILTS, and a tilted rotor disc points less of its
+# thrust straight up, so the drone sags. A big tilt = a big sag. Capping tilt to
+# 20deg (the PX4 minimum) keeps almost all thrust vertical, so altitude stays
+# put. It also limits horizontal accel to ~g*tan(20) ~= 3.6 m/s^2, which is far
+# more than our <1 m/s flight needs. Steady altitude also keeps the 2D scan
+# plane level, which is what stops Cartographer losing tracking mid-flight.
+param set MPC_TILTMAX_AIR 20.0   # was 45.0 - stop altitude sag during maneuvers
+
+# ---------------------------------------------------------------------------
+# COLLISION PREVENTION (PX4 built-in) is deliberately LEFT OFF here (CP_DIST
+# stays at its -1 default). PX4's collision prevention needs a live
+# OBSTACLE_DISTANCE feed, and with CP_GO_NO_DATA=0 it *blocks all motion* when
+# that feed is missing -- a great way to make the drone refuse to fly. More
+# importantly, it is designed for Position mode / velocity setpoints, not the
+# OFFBOARD *position* setpoints we use. So wall-avoidance is done instead in the
+# follower with a reactive LiDAR brake (see path_follower_position.py): it reads
+# raw /scan in the body frame, which is immune to any SLAM/localisation error --
+# exactly the failure that would otherwise steer a "valid" path into a wall.

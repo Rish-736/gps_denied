@@ -70,13 +70,42 @@ class FrontierExplorer(Node):
         self.declare_parameter('free_threshold', 50)
         self.declare_parameter('replan_period_sec', 2.0)
         # Scoring: cost = distance - info_weight * frontier_size_in_metres.
-        # Higher info_weight favours big unexplored openings over close scraps.
-        self.declare_parameter('info_weight', 1.5)
+        # LOWERED to 0.4 (was 1.5): with a bigger info weight the explorer chased
+        # large frontiers on the far side of the maze, forcing long fast flights
+        # that broke SLAM. Now distance dominates, so it sweeps the maze
+        # methodically corridor-by-corridor -- short hops keep flight slow and
+        # SLAM locked.
+        self.declare_parameter('info_weight', 0.4)
+        # Local-first sweep: if any acceptable frontier is within this radius,
+        # only those are considered -- the drone finishes its neighbourhood
+        # before ever committing to a far one. Far frontiers are used only when
+        # nothing nearer remains.
+        self.declare_parameter('sweep_radius', 5.0)
         # Bonus subtracted from the cost of the goal already being pursued, so
         # the drone commits instead of flip-flopping between similar options.
         self.declare_parameter('hysteresis_bonus', 2.0)
         self.declare_parameter('goal_timeout_sec', 45.0)
         self.declare_parameter('blacklist_after_failures', 3)
+        # VISITED MEMORY -- so it explores the WHOLE maze and doesn't loop in one
+        # area. The drone's own trail is recorded on a coarse grid; a frontier
+        # near cells it has already spent time in is penalised, pushing it toward
+        # genuinely new ground. (Frontier exploration is coverage-complete on its
+        # own -- an explored area stops being a frontier -- but this stops the
+        # drone oscillating between two nearby frontiers and re-flying the same
+        # corridor, which is what we saw.)
+        self.declare_parameter('visit_cell_size', 0.75)
+        self.declare_parameter('visit_weight', 0.6)
+        self.declare_parameter('visit_radius', 1.5)
+        # STUCK DETECTION -- if the drone hasn't made real headway toward a goal
+        # for this long, abandon it and pick another (covers "planner returns a
+        # path but the drone can't actually get there", e.g. a doorway too tight).
+        self.declare_parameter('stuck_window_sec', 12.0)
+        self.declare_parameter('stuck_min_move_m', 0.4)
+        # How many consecutive empty-frontier cycles before declaring the maze
+        # done and returning home. A single empty cycle is usually a transient
+        # (the map momentarily has no cluster >= min_cells); returning on that
+        # sent the drone home far too early last time.
+        self.declare_parameter('empty_cycles_to_finish', 4)
 
         # ARENA BOUNDS -- the drone spawns at (0,0) in the entry cell ON the
         # maze's south boundary, so its LiDAR looks straight out through the
@@ -100,12 +129,19 @@ class FrontierExplorer(Node):
         self.min_dist = g('min_goal_distance')
         self.free_threshold = g('free_threshold')
         self.info_weight = g('info_weight')
+        self.sweep_radius = g('sweep_radius')
         self.hysteresis = g('hysteresis_bonus')
         self.goal_timeout = g('goal_timeout_sec')
         self.max_failures = g('blacklist_after_failures')
         self.min_x, self.max_x = g('arena_min_x'), g('arena_max_x')
         self.min_y, self.max_y = g('arena_min_y'), g('arena_max_y')
         self.map_frame, self.body_frame = g('map_frame'), g('body_frame')
+        self.visit_cell = g('visit_cell_size')
+        self.visit_weight = g('visit_weight')
+        self.visit_radius = g('visit_radius')
+        self.stuck_window = g('stuck_window_sec')
+        self.stuck_min_move = g('stuck_min_move_m')
+        self.empty_cycles_to_finish = g('empty_cycles_to_finish')
 
         self.map_msg = None
         # Pose in the MAP frame -- same frame as the grid and the path.
@@ -120,6 +156,10 @@ class FrontierExplorer(Node):
         self.returning = False
         self.mission_done = False
         self._waiting = 0
+        self.visited = {}               # coarse cell -> visit count (the "memory")
+        self.empty_count = 0            # consecutive cycles with no frontier
+        self.goal_anchor = None         # (x, y) where the current goal was set
+        self.goal_anchor_time = None    # when we last made real headway
 
         map_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -130,6 +170,13 @@ class FrontierExplorer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.create_subscription(OccupancyGrid, '/map', self._on_map, map_qos)
+        # Coverage grid from coverage_tracker: which arena cells still need the
+        # camera pointed at them. These become goals just like frontiers, so the
+        # drone keeps flying until every reachable cell is SEARCHED (not merely
+        # mapped) -- the guarantee that no survivor's corner is skipped.
+        self.coverage_msg = None
+        self.create_subscription(
+            OccupancyGrid, '/coverage_grid', self._on_coverage, map_qos)
         self.create_subscription(
             Bool, '/path_follower/reached', self._on_reached, 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/frontiers', 5)
@@ -144,6 +191,9 @@ class FrontierExplorer(Node):
     # ---------------------------------------------------------------- inputs
     def _on_map(self, msg):
         self.map_msg = msg
+
+    def _on_coverage(self, msg):
+        self.coverage_msg = msg
 
     def _read_pose(self):
         """Drone position in the MAP frame. Time() = latest available, which
@@ -160,6 +210,24 @@ class FrontierExplorer(Node):
             self.entry_xy = (self.px, self.py)
             self.get_logger().info(
                 f'Entry/exit point recorded at ({self.px:.2f}, {self.py:.2f})')
+        # Record the trail: this coarse cell has now been visited. This is the
+        # explorer's memory of where it has already been.
+        self.visited[self._visit_key(self.px, self.py)] = \
+            self.visited.get(self._visit_key(self.px, self.py), 0) + 1
+
+    def _visit_key(self, x, y):
+        return (round(x / self.visit_cell), round(y / self.visit_cell))
+
+    def _visit_penalty(self, wx, wy):
+        """How much time the drone has already spent near (wx, wy). Frontiers in
+        well-trodden areas score worse, so exploration keeps pushing outward."""
+        r = int(self.visit_radius / self.visit_cell) + 1
+        cx, cy = self._visit_key(wx, wy)
+        count = 0
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                count += self.visited.get((cx + dx, cy + dy), 0)
+        return self.visit_weight * min(count, 20)   # cap so it never dominates
 
     def _on_reached(self, msg):
         if not (msg.data and self.goal is not None):
@@ -242,14 +310,46 @@ class FrontierExplorer(Node):
             dist = math.hypot(wx - self.px, wy - self.py)
             if dist < self.min_dist:
                 continue        # already here; nothing new revealed
-            # Prefer close AND large. Size is converted to metres so the two
-            # terms are comparable regardless of grid resolution.
-            cost = dist - self.info_weight * (len(group) * res)
+            # Prefer close AND large AND unexplored. Size in metres so the terms
+            # are comparable regardless of grid resolution; the visit penalty
+            # pushes exploration away from areas already covered (the memory).
+            cost = (dist
+                    - self.info_weight * (len(group) * res)
+                    + self._visit_penalty(wx, wy))
             if self.goal is not None and math.hypot(
                     wx - self.goal[0], wy - self.goal[1]) < 1.0:
                 cost -= self.hysteresis     # stick with what we're already chasing
             out.append((cost, wx, wy, len(group), dist))
-        out.sort(key=lambda c: c[0])
+        return out
+
+    def _coverage_candidates(self):
+        """Unsearched free cells from the coverage grid, as goals. These make
+        the drone fly to any mapped-but-not-yet-seen area (e.g. a room it flew
+        past) so the camera actually sweeps it -- the coverage guarantee. Same
+        (cost, wx, wy, size, dist) shape as frontier candidates; size is 0 (a
+        coverage cell carries no 'frontier size')."""
+        cov = self.coverage_msg
+        if cov is None:
+            return []
+        info = cov.info
+        ox, oy, res = info.origin.position.x, info.origin.position.y, info.resolution
+        out = []
+        for i, v in enumerate(cov.data):
+            if v != 0:                  # 0 == free & UNSEARCHED (the to-do cells)
+                continue
+            col, row = i % info.width, i // info.width
+            wx = ox + (col + 0.5) * res
+            wy = oy + (row + 0.5) * res
+            if self.blacklist.get(self._key((wx, wy)), 0) >= self.max_failures:
+                continue
+            dist = math.hypot(wx - self.px, wy - self.py)
+            if dist < self.min_dist:
+                continue
+            cost = dist + self._visit_penalty(wx, wy)
+            if self.goal is not None and math.hypot(
+                    wx - self.goal[0], wy - self.goal[1]) < 1.0:
+                cost -= self.hysteresis
+            out.append((cost, wx, wy, 0, dist))
         return out
 
     def _publish_markers(self, clusters):
@@ -289,34 +389,73 @@ class FrontierExplorer(Node):
         if self.mission_done or self.plan_pending:
             return
 
-        # Give up on a goal we've chased too long, and remember the failure.
+        # Give up on a goal we've chased too long OR made no headway toward
+        # (stuck), and remember the failure so we don't re-pick it.
         if self.goal is not None and self.goal_start is not None:
-            elapsed = (self.get_clock().now() - self.goal_start).nanoseconds / 1e9
-            if elapsed > self.goal_timeout:
+            now = self.get_clock().now()
+            elapsed = (now - self.goal_start).nanoseconds / 1e9
+            # Stuck: has the drone actually moved since we last saw progress?
+            if self.goal_anchor is None:
+                self.goal_anchor = (self.px, self.py)
+                self.goal_anchor_time = now
+            moved = math.hypot(self.px - self.goal_anchor[0],
+                               self.py - self.goal_anchor[1])
+            if moved > self.stuck_min_move:
+                self.goal_anchor = (self.px, self.py)
+                self.goal_anchor_time = now
+            stuck_for = (now - self.goal_anchor_time).nanoseconds / 1e9
+            if elapsed > self.goal_timeout or stuck_for > self.stuck_window:
                 k = self._key(self.goal)
                 self.blacklist[k] = self.blacklist.get(k, 0) + 1
+                why = 'timeout' if elapsed > self.goal_timeout else 'stuck (no progress)'
                 self.get_logger().warn(
-                    f'Goal {self.goal[0]:.2f},{self.goal[1]:.2f} not reached in '
-                    f'{self.goal_timeout:.0f}s -> abandoning '
-                    f'(failures={self.blacklist[k]})')
+                    f'Goal {self.goal[0]:.2f},{self.goal[1]:.2f} abandoned '
+                    f'[{why}] (failures={self.blacklist[k]})')
                 self.goal = None
+                self.goal_anchor = None
 
         clusters = self._cluster(self._find_frontiers())
         self._publish_markers(clusters)
-        cands = self._candidates(clusters)
+        # Goals = frontiers (expand the map into unknown) + unsearched coverage
+        # cells (point the camera at mapped-but-unseen areas). The drone only
+        # finishes when BOTH are exhausted -> the whole reachable arena is both
+        # mapped AND searched.
+        cands = self._candidates(clusters) + self._coverage_candidates()
+        cands.sort(key=lambda c: c[0])
+        # Local-first sweep: if anything is within sweep_radius, drop the far
+        # ones so the drone finishes its neighbourhood before a long (SLAM-
+        # stressing) traverse. Far goals survive only when nothing near remains.
+        near = [c for c in cands if c[4] <= self.sweep_radius]
+        if near:
+            cands = near
 
         if not cands:
-            # Exploration finished -> fly back to the entry/exit point so the
-            # full in-and-out loop closes.
+            # Might just be a transient (a single cycle with no cluster big
+            # enough). Only declare the mission finished after several empty
+            # cycles in a row -- returning on the first one sent the drone home
+            # far too early last time.
+            self.empty_count += 1
+            if self.empty_count < self.empty_cycles_to_finish and not self.returning:
+                return
             if self.entry_xy is None:
                 return
             if not self.returning:
                 self.returning = True
                 self.get_logger().info(
-                    'No frontiers left -> returning to entry/exit point')
+                    f'No frontiers for {self.empty_count} cycles -> maze mapped, '
+                    'returning to entry/exit point')
             self.goal = self.entry_xy
             self._request_path(self.entry_xy[0], self.entry_xy[1], 0, 0.0, 0)
             return
+
+        # Frontiers exist -> we are NOT finished. Reset the empty counter, and if
+        # we had prematurely switched to 'returning', cancel it and keep exploring.
+        self.empty_count = 0
+        if self.returning:
+            self.returning = False
+            self.goal = None
+            self.get_logger().info(
+                'New frontiers appeared -> resuming exploration (not returning)')
 
         # Drop a goal that the map has since revealed (no frontier near it any
         # more) so we don't fly to an already-explored spot.
@@ -331,6 +470,8 @@ class FrontierExplorer(Node):
         if self.goal is None or math.hypot(wx - self.goal[0], wy - self.goal[1]) > 1.0:
             self.goal = (wx, wy)
             self.goal_start = self.get_clock().now()
+            self.goal_anchor = (self.px, self.py)   # reset stuck detector
+            self.goal_anchor_time = self.goal_start
         # Refresh the route to the committed goal every cycle so the follower
         # always has a path consistent with the newest map.
         self._request_path(self.goal[0], self.goal[1], size, dist, len(cands))

@@ -55,20 +55,30 @@ TRAJECTORY_BUILDER_2D.max_range = 10.
 -- 13.5m maze punches straight through walls and erases them -> washed-out,
 -- unclear walls. 5m (the Cartographer default) keeps free-space carving local.
 TRAJECTORY_BUILDER_2D.missing_data_ray_length = 5.
--- OFF (2026-09-02). This was toggled on twice to fix an apparent "map drift at
--- turns" -- but that diagnosis was WRONG. The map wasn't drifting: the drone was
--- flying OUT of the maze through the entry gap and legitimately mapping the open
--- ground outside, because the frontier explorer had no arena bounds. That's now
--- fixed there. So the IMU was solving a problem that didn't exist, while
--- historically correlating with EKF instability. Back to the config that flew
--- the maze cleanly.
+-- ON (2026-09-03). Re-enabled after headless flight tests showed the REAL
+-- blocker: Cartographer's pose diverges mid-flight (SLAM and PX4's EKF drift
+-- apart, then feed each other garbage -> runaway). Cause: with IMU off,
+-- Cartographer matches scan-to-scan only, which is fragile on a jittery, moving
+-- drone -- doubly so in a maze of look-alike parallel walls (scan aliasing).
+-- The IMU gives the scan matcher a motion prior between scans, the standard fix
+-- for airborne 2D SLAM.
 --
--- Worth revisiting ONLY if real turn-drift shows up once exploration is properly
--- bounded -- and then as an isolated change, verifying const_pos_mode stays
--- false. (vision_pose_bridge's pose-jump guard stays regardless; it's good
--- protection either way.)
-TRAJECTORY_BUILDER_2D.use_imu_data = false
+-- The earlier "IMU caused EKF divergence" was a MISDIAGNOSIS: that instability
+-- was the map<->PX4-local frame-mixing bug (fixed in the follower/explorer) and
+-- the out-of-maze mapping (fixed by arena bounds), not Cartographer's use of
+-- IMU -- which is internal to SLAM and independent of PX4's EKF. Kept honest by
+-- the divergence failsafe in vision_pose_bridge, which now hovers/lands if SLAM
+-- does go bad, instead of flying off lost.
+TRAJECTORY_BUILDER_2D.use_imu_data = true
+-- Trust the scan matcher, but let the IMU-propagated pose seed each match so a
+-- single bad scan can't yank the estimate. These weights are Cartographer's
+-- airborne-friendly defaults for 2D.
 TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 10.
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 40.
+-- The x500's IMU streams fast; a short gravity time-constant keeps attitude
+-- tracking responsive without chasing noise.
+TRAJECTORY_BUILDER_2D.imu_gravity_time_constant = 1.
 
 -- Motion filter: these were TurtleBot3 values. A wheeled robot sits perfectly
 -- still, so a 0.1 DEGREE threshold was fine there. A hovering drone always
@@ -84,8 +94,26 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 5.
 -- small arena means fewer seams and a steadier map.
 TRAJECTORY_BUILDER_2D.submaps.num_range_data = 120
 
-POSE_GRAPH.constraint_builder.min_score = 0.65
-POSE_GRAPH.constraint_builder.global_localization_min_score = 0.7
+-- CONSERVATIVE LOOP CLOSURE (2026-09-03). Flight tests found the real cause of
+-- the mid-flight divergence: Cartographer's pose graph made a WRONG loop
+-- closure -- it matched the current scan to a look-alike corridor elsewhere in
+-- the maze and snapped the whole trajectory ~13m to that wrong place, after
+-- which everything downstream followed the bad pose into a runaway. A maze of
+-- near-identical parallel corridors is exactly where scan aliasing fools loop
+-- closure. The fixes below make it only accept HIGH-confidence constraints and
+-- never match across the whole arena:
+--   * higher min_score -> reject marginal matches (the wrong ones)
+--   * shorter max_constraint_distance -> don't try to loop-close against far
+--     submaps, which is where the aliased wrong matches came from
+--   * tighter fast-correlative search window -> can't jump far to "find" a match
+-- The arena is only ~15 m, so local scan matching + IMU already give good
+-- odometry; we don't need aggressive global loop closure, and its downside
+-- (catastrophic wrong snaps) is far worse than a little uncorrected drift.
+POSE_GRAPH.constraint_builder.min_score = 0.72
+POSE_GRAPH.constraint_builder.global_localization_min_score = 0.80
+POSE_GRAPH.constraint_builder.max_constraint_distance = 9.
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 4.
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(20.)
 
 -- Every optimisation pass shifts submaps, which is what you SEE as the map
 -- jumping. With the motion filter fixed above, nodes accumulate at a sane rate,

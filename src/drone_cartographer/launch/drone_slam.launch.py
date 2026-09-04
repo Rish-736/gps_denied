@@ -69,8 +69,17 @@ def launch_setup(context, *args, **kwargs):
             package='ros_gz_bridge', executable='parameter_bridge',
             name='imu_bridge',
             arguments=[f'{imu_gz}@sensor_msgs/msg/Imu[gz.msgs.IMU'],
-            remappings=[(imu_gz, '/imu')],
+            # -> /imu_raw, then imu_monotonic_filter cleans it -> /imu. The
+            # bridge occasionally emits an out-of-order stamp, which makes
+            # Cartographer's ImuTracker abort (imu_tracker.cc:40). The filter
+            # drops those so Cartographer sees a strictly-increasing stream.
+            remappings=[(imu_gz, '/imu_raw')],
             output='screen',
+        ),
+        # /imu_raw -> /imu, enforcing monotonic timestamps for Cartographer.
+        ExecuteProcess(
+            cmd=['python3', os.path.join(SCRIPTS_DIR, 'imu_monotonic_filter.py')],
+            name='imu_monotonic_filter', output='screen',
         ),
         # gz -> /clock  (sim time)
         Node(
