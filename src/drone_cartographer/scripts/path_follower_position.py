@@ -92,7 +92,7 @@ class PathFollowerPosition(Node):
         # IS the position error PX4 sees, so it sets the cruise speed together
         # with MPC_XY_P: 0.6m * 0.95 ~= 0.57 m/s, under MPC_XY_CRUISE (0.8).
         # Bigger = faster but cuts corners harder in tight maze turns.
-        self.declare_parameter('lookahead', 0.6)
+        self.declare_parameter('lookahead', 0.4)
         self.declare_parameter('rate_hz', 20.0)
         self.declare_parameter('goal_tolerance', 0.35)
         self.declare_parameter('map_frame', 'map')
@@ -111,7 +111,7 @@ class PathFollowerPosition(Node):
         # larger release distance gives hysteresis: without it the brake chattered
         # on/off every ~50 ms near a wall, jerking the setpoint and destabilising
         # the aircraft (this made a real flight diverge).
-        self.declare_parameter('brake_distance', 0.55)
+        self.declare_parameter('brake_distance', 0.45)
         self.declare_parameter('brake_release_distance', 0.85)
         self.declare_parameter('brake_cone_deg', 50.0)
         # WALL REPULSION -- stops the drone's ARMS clipping a wall. The x500 is
@@ -123,10 +123,10 @@ class PathFollowerPosition(Node):
         # corridor the two walls cancel, so the drone self-centres; at a corner
         # the inside wall pushes it wide so the arm clears. robot_radius is the
         # prop-tip radius the field must protect.
-        self.declare_parameter('robot_radius', 0.35)
-        self.declare_parameter('repulsion_influence', 0.9)
-        self.declare_parameter('repulsion_gain', 0.8)
-        self.declare_parameter('repulsion_max', 0.6)
+        self.declare_parameter('robot_radius', 0.30)
+        self.declare_parameter('repulsion_influence', 0.7)
+        self.declare_parameter('repulsion_gain', 0.5)
+        self.declare_parameter('repulsion_max', 0.25)
         # Localisation-divergence failsafe: if the estimated map<->PX4-local
         # offset exceeds this (after it has had time to settle), SLAM/EKF have
         # diverged -- LAND. Catches the slow-drift runaway the speed detector in
@@ -146,6 +146,15 @@ class PathFollowerPosition(Node):
         # without the position lagging.
         self.declare_parameter('setpoint_lpf', 0.35)
         self.declare_parameter('yaw_lpf', 0.20)
+        # LOCAL-MINIMUM ESCAPE. Reactive repulsion can trap the drone at a spot
+        # where wall pushes cancel the goal pull (it "gets stuck at one point").
+        # Keeping repulsion_max < lookahead already stops most of this, but as a
+        # safety net: if it makes no real progress for escape_stuck_sec while a
+        # path exists and nothing is dead ahead, suppress repulsion briefly so
+        # the goal pull frees it.
+        self.declare_parameter('escape_stuck_sec', 5.0)
+        self.declare_parameter('escape_duration_sec', 3.0)
+        self.declare_parameter('escape_min_move', 0.25)
         # Safe recovery: if SLAM stays lost this long, stop hovering blind and
         # LAND (PX4 AUTO.LAND descends on baro, needs no position estimate). This
         # is what makes the drone "come down safely" instead of flying off when
@@ -171,6 +180,9 @@ class PathFollowerPosition(Node):
         self.look_radius = self.get_parameter('coverage_look_radius').value
         self.sp_lpf = self.get_parameter('setpoint_lpf').value
         self.yaw_lpf = self.get_parameter('yaw_lpf').value
+        self.escape_stuck_sec = self.get_parameter('escape_stuck_sec').value
+        self.escape_duration = self.get_parameter('escape_duration_sec').value
+        self.escape_min_move = self.get_parameter('escape_min_move').value
         self.land_after = self.get_parameter('land_after_slam_lost_sec').value
         rate_hz = self.get_parameter('rate_hz').value
         # low-pass state for the repulsion vector (avoid setpoint jitter)
@@ -179,6 +191,10 @@ class PathFollowerPosition(Node):
         # can snap-initialise it and avoid a startup lurch
         self.cmd_x = self.cmd_y = self.cmd_yaw = None
         self.coverage_grid = None
+        # local-minimum escape state
+        self._progress_pos = None
+        self._progress_time = None
+        self._escaping_until = None
 
         # --- pose in the MAP frame (Cartographer, same frame as the path) ---
         self.mx = self.my = self.myaw = 0.0
@@ -591,10 +607,40 @@ class PathFollowerPosition(Node):
             if self._brake_check(body_bearing):
                 tx, ty, tyaw = self._hold()
 
+        # LOCAL-MINIMUM ESCAPE. Track real progress; if the drone has a path but
+        # hasn't moved for escape_stuck_sec and nothing is dead ahead, it's
+        # trapped in a repulsion local minimum -> enter a short escape window
+        # during which repulsion is suppressed so the goal pull frees it.
+        now = self.get_clock().now()
+        if self.airborne and self.path and not self.brake_active:
+            if self._progress_pos is None:
+                self._progress_pos = (self.mx, self.my)
+                self._progress_time = now
+            elif math.hypot(self.mx - self._progress_pos[0],
+                            self.my - self._progress_pos[1]) > self.escape_min_move:
+                self._progress_pos = (self.mx, self.my)
+                self._progress_time = now
+            elif (now - self._progress_time).nanoseconds / 1e9 > self.escape_stuck_sec:
+                if self._escaping_until is None:
+                    self.get_logger().warn(
+                        'Stuck (repulsion local minimum) -> suppressing repulsion to escape')
+                self._escaping_until = (now.nanoseconds
+                                        + self.escape_duration * 1e9)
+                self._progress_pos = (self.mx, self.my)
+                self._progress_time = now
+        else:
+            self._progress_pos = None
+
+        escaping = (self._escaping_until is not None
+                    and now.nanoseconds < self._escaping_until)
+        if self._escaping_until is not None and now.nanoseconds >= self._escaping_until:
+            self._escaping_until = None
+
         # WALL REPULSION. Always nudge the setpoint away from nearby walls (even
         # while holding/braking, so a hold near a wall still eases off it). This
-        # is what keeps the arms from clipping a wall on a turn.
-        if self.airborne:
+        # is what keeps the arms from clipping a wall on a turn. Suppressed
+        # briefly during a local-minimum escape.
+        if self.airborne and not escaping:
             rmx, rmy = self._repulsion_map()
             tx += rmx
             ty += rmy

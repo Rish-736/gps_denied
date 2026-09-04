@@ -84,7 +84,16 @@ def generate_launch_description():
             cmd=['python3', os.path.join(SCRIPTS, 'path_follower_position.py'),
                  '--ros-args',
                  '-p', ['target_altitude:=', altitude],
-                 '-p', ['lookahead:=', LaunchConfiguration('lookahead')]],
+                 '-p', ['lookahead:=', LaunchConfiguration('lookahead')],
+                 # Wall-avoidance / smoothing knobs, exposed so they can be tuned
+                 # from the command line per maze without editing code.
+                 '-p', ['robot_radius:=', LaunchConfiguration('robot_radius')],
+                 '-p', ['repulsion_influence:=', LaunchConfiguration('repulsion_influence')],
+                 '-p', ['repulsion_gain:=', LaunchConfiguration('repulsion_gain')],
+                 '-p', ['repulsion_max:=', LaunchConfiguration('repulsion_max')],
+                 '-p', ['brake_distance:=', LaunchConfiguration('brake_distance')],
+                 '-p', ['setpoint_lpf:=', LaunchConfiguration('setpoint_lpf')],
+                 '-p', ['yaw_lpf:=', LaunchConfiguration('yaw_lpf')]],
             name='path_follower_position', output='screen'),
         # arm -> OFFBOARD (setpoints already streaming from the follower),
         # no pxh> typing.
@@ -118,6 +127,24 @@ def generate_launch_description():
         # to whatever the organizers confirm for the real arena.
         DeclareLaunchArgument('cell_size', default_value='1.0',
                               description='Coverage & survivor-report grid cell size (m)'),
+        # --- Wall-avoidance / smoothing tuning knobs (the "threshold values") ---
+        # Defaults are set for ~1.2 m spec corridors: repulsion_max MUST stay well
+        # under the corridor half-width (0.6 m here) or a push off one wall
+        # overshoots into the other and the drone wobbles wall-to-wall.
+        DeclareLaunchArgument('robot_radius', default_value='0.30',
+                              description='Prop-tip radius the repulsion protects (m)'),
+        DeclareLaunchArgument('repulsion_influence', default_value='0.7',
+                              description='Start pushing when a wall is closer than this (m, from prop tips)'),
+        DeclareLaunchArgument('repulsion_gain', default_value='0.5',
+                              description='How hard to push off walls (higher = stronger)'),
+        DeclareLaunchArgument('repulsion_max', default_value='0.25',
+                              description='Max sideways shift (m); keep << corridor half-width'),
+        DeclareLaunchArgument('brake_distance', default_value='0.45',
+                              description='Hard-stop if a wall is closer than this ahead (m)'),
+        DeclareLaunchArgument('setpoint_lpf', default_value='0.35',
+                              description='Position smoothing 0..1 (lower = smoother, laggier)'),
+        DeclareLaunchArgument('yaw_lpf', default_value='0.20',
+                              description='Yaw smoothing 0..1 (lower = smoother)'),
         *nav2,
         *explorer_and_follower,
     ])
