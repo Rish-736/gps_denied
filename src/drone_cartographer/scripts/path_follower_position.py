@@ -64,7 +64,7 @@ from rclpy.time import Time
 from rclpy.qos import (QoSProfile, ReliabilityPolicy, HistoryPolicy,
                        DurabilityPolicy)
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
+from nav_msgs.msg import Path, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
 from mavros_msgs.srv import SetMode
@@ -132,6 +132,20 @@ class PathFollowerPosition(Node):
         # diverged -- LAND. Catches the slow-drift runaway the speed detector in
         # vision_pose_bridge can miss.
         self.declare_parameter('max_offset_m', 3.0)
+        # COVERAGE-AWARE YAW: point the camera at the nearest UNSEARCHED cell
+        # (from /coverage_grid) instead of always facing travel direction. An
+        # omni multirotor can strafe along the path while the camera looks
+        # sideways, so this searches the near-wall / side cells that flying
+        # head-down a corridor would skip -- the reason coverage stalled at 79%.
+        self.declare_parameter('coverage_yaw', True)
+        self.declare_parameter('coverage_look_radius', 3.5)
+        # SMOOTHING: low-pass the published setpoint and yaw so a jumping carrot
+        # (2 s replans, per-tick repulsion, yaw target hops) becomes smooth
+        # motion instead of the twitchy flight seen in the sim. Lower alpha =
+        # smoother but laggier. yaw_lpf is separate so heading can ease over
+        # without the position lagging.
+        self.declare_parameter('setpoint_lpf', 0.35)
+        self.declare_parameter('yaw_lpf', 0.20)
         # Safe recovery: if SLAM stays lost this long, stop hovering blind and
         # LAND (PX4 AUTO.LAND descends on baro, needs no position estimate). This
         # is what makes the drone "come down safely" instead of flying off when
@@ -153,10 +167,18 @@ class PathFollowerPosition(Node):
         self.repulsion_gain = self.get_parameter('repulsion_gain').value
         self.repulsion_max = self.get_parameter('repulsion_max').value
         self.max_offset = self.get_parameter('max_offset_m').value
+        self.coverage_yaw = self.get_parameter('coverage_yaw').value
+        self.look_radius = self.get_parameter('coverage_look_radius').value
+        self.sp_lpf = self.get_parameter('setpoint_lpf').value
+        self.yaw_lpf = self.get_parameter('yaw_lpf').value
         self.land_after = self.get_parameter('land_after_slam_lost_sec').value
         rate_hz = self.get_parameter('rate_hz').value
         # low-pass state for the repulsion vector (avoid setpoint jitter)
         self.rep_x = self.rep_y = 0.0
+        # smoothed command state (map frame); None until first active tick so we
+        # can snap-initialise it and avoid a startup lurch
+        self.cmd_x = self.cmd_y = self.cmd_yaw = None
+        self.coverage_grid = None
 
         # --- pose in the MAP frame (Cartographer, same frame as the path) ---
         self.mx = self.my = self.myaw = 0.0
@@ -205,6 +227,8 @@ class PathFollowerPosition(Node):
                                  self._on_local, sensor_qos)
         self.create_subscription(LaserScan, '/scan', self._on_scan, sensor_qos)
         self.create_subscription(Bool, '/slam_ok', self._on_slam_ok, latched)
+        self.create_subscription(
+            OccupancyGrid, '/coverage_grid', self._on_coverage, latched)
         self.sp_pub = self.create_publisher(
             PoseStamped, '/mavros/setpoint_position/local', 10)
         self.reached_pub = self.create_publisher(Bool, '/path_follower/reached', 10)
@@ -249,6 +273,35 @@ class PathFollowerPosition(Node):
 
     def _on_scan(self, msg: LaserScan):
         self.scan = msg
+
+    def _on_coverage(self, msg: OccupancyGrid):
+        self.coverage_grid = msg
+
+    def _look_yaw(self, travel_yaw):
+        """Coverage-aware heading: if an UNSEARCHED cell is within look_radius,
+        face it so the camera searches it; otherwise face travel direction.
+        Decoupling camera aim from motion is fine here -- the brake checks the
+        travel cone (not the yaw) and repulsion is 360-degree, so aiming the
+        camera sideways doesn't reduce obstacle protection."""
+        if not self.coverage_yaw or self.coverage_grid is None:
+            return travel_yaw
+        cov = self.coverage_grid
+        info = cov.info
+        ox, oy, res = info.origin.position.x, info.origin.position.y, info.resolution
+        best = None
+        best_d = self.look_radius
+        for i, v in enumerate(cov.data):
+            if v != 0:                  # 0 == free & UNSEARCHED
+                continue
+            col, row = i % info.width, i // info.width
+            wx = ox + (col + 0.5) * res
+            wy = oy + (row + 0.5) * res
+            d = math.hypot(wx - self.mx, wy - self.my)
+            if d < best_d:
+                best_d, best = d, (wx, wy)
+        if best is None:
+            return travel_yaw
+        return math.atan2(best[1] - self.my, best[0] - self.mx)
 
     def _on_slam_ok(self, msg: Bool):
         if msg.data != self.slam_ok:
@@ -506,6 +559,7 @@ class PathFollowerPosition(Node):
                 if lost_for > self.land_after and not self.landing:
                     self._commit_land()
             if not self.landing:
+                self.cmd_x = self.cmd_y = self.cmd_yaw = None   # reset smoother
                 self._publish_setpoint(self.lx, self.ly, self.lyaw, 'local-hover')
             return
         if self.landing:
@@ -545,8 +599,22 @@ class PathFollowerPosition(Node):
             tx += rmx
             ty += rmy
 
+        # COVERAGE-AWARE YAW: aim the camera at the nearest unsearched cell.
+        tyaw = self._look_yaw(tyaw)
+
+        # SMOOTHING: low-pass the command so a jumping carrot / repulsion / yaw
+        # target becomes smooth motion. Snap-initialise on the first tick (and
+        # after any hover) so there's no lurch.
+        if self.cmd_x is None:
+            self.cmd_x, self.cmd_y, self.cmd_yaw = tx, ty, tyaw
+        else:
+            self.cmd_x += self.sp_lpf * (tx - self.cmd_x)
+            self.cmd_y += self.sp_lpf * (ty - self.cmd_y)
+            self.cmd_yaw = wrap(self.cmd_yaw
+                                + self.yaw_lpf * wrap(tyaw - self.cmd_yaw))
+
         # Reasoned in MAP; convert to PX4's local frame for the setpoint topic.
-        sx, sy, syaw = self._map_to_local(tx, ty, tyaw)
+        sx, sy, syaw = self._map_to_local(self.cmd_x, self.cmd_y, self.cmd_yaw)
         self._publish_setpoint(sx, sy, syaw, 'map->local')
 
         carrot = PoseStamped()

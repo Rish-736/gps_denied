@@ -203,16 +203,28 @@ class CoverageTracker(Node):
                 if self.state[row][col] == SEARCHED:
                     searched_total += 1
                     continue
-                # Unsearched free cell: can the camera see it from here?
+                # Unsearched free cell: can the camera see it from here? Test
+                # several points across the cell (centre + quarters), not just
+                # the centre -- a 1 m cell that straddles a thin wall has its
+                # centre blocked from LOS but its free part is perfectly
+                # visible, and a survivor there would be seen. Marking on ANY
+                # visible sub-point stops those cells stalling coverage forever.
                 cx, cy = self._cell_center(col, row)
-                d = math.hypot(cx - dx, cy - dy)
-                if d > self.cam_range:
-                    continue
-                if d > 1e-3:
-                    bearing = math.atan2(cy - dy, cx - dx)
-                    if abs(wrap(bearing - dyaw)) > half_fov:
-                        continue        # outside the camera cone
-                if self._los_clear(dx, dy, cx, cy):
+                q = self.cell * 0.3
+                seen = False
+                for sx, sy in ((cx, cy), (cx + q, cy + q), (cx - q, cy + q),
+                               (cx + q, cy - q), (cx - q, cy - q)):
+                    d = math.hypot(sx - dx, sy - dy)
+                    if d > self.cam_range:
+                        continue
+                    if d > 1e-3:
+                        bearing = math.atan2(sy - dy, sx - dx)
+                        if abs(wrap(bearing - dyaw)) > half_fov:
+                            continue    # outside the camera cone
+                    if self._los_clear(dx, dy, sx, sy):
+                        seen = True
+                        break
+                if seen:
                     self.state[row][col] = SEARCHED
                     searched_total += 1
 

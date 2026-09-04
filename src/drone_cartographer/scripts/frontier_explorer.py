@@ -106,6 +106,17 @@ class FrontierExplorer(Node):
         # (the map momentarily has no cluster >= min_cells); returning on that
         # sent the drone home far too early last time.
         self.declare_parameter('empty_cycles_to_finish', 4)
+        # Search-done criteria (either one, once the map has no frontiers left):
+        #  * coverage >= coverage_complete_pct (a clear high-water mark), OR
+        #  * coverage has PLATEAUED (not improved by >0.5% in coverage_stall_sec)
+        #    -- the robust one, because the achievable ceiling varies run to run
+        #    (a few 1 m cells straddle walls and can never be LOS-confirmed, and
+        #    no survivor fits there). Without this the drone circles the last
+        #    cells forever and never returns -- failing the rulebook's "exit via
+        #    the entry" rule and draining the battery. Remaining cells are
+        #    reported in the log, not hidden.
+        self.declare_parameter('coverage_complete_pct', 97.0)
+        self.declare_parameter('coverage_stall_sec', 40.0)
 
         # ARENA BOUNDS -- the drone spawns at (0,0) in the entry cell ON the
         # maze's south boundary, so its LiDAR looks straight out through the
@@ -142,6 +153,10 @@ class FrontierExplorer(Node):
         self.stuck_window = g('stuck_window_sec')
         self.stuck_min_move = g('stuck_min_move_m')
         self.empty_cycles_to_finish = g('empty_cycles_to_finish')
+        self.coverage_complete_pct = g('coverage_complete_pct')
+        self.coverage_stall_sec = g('coverage_stall_sec')
+        self._best_frac = -1.0          # highest coverage seen
+        self._best_frac_time = None     # when it last improved
 
         self.map_msg = None
         # Pose in the MAP frame -- same frame as the grid and the path.
@@ -194,6 +209,27 @@ class FrontierExplorer(Node):
 
     def _on_coverage(self, msg):
         self.coverage_msg = msg
+
+    def _coverage_frac(self):
+        """Coverage as a percentage float, or None if no coverage grid yet."""
+        cov = self.coverage_msg
+        if cov is None:
+            return None
+        searched = sum(1 for v in cov.data if v == 100)
+        free = sum(1 for v in cov.data if v in (0, 100))
+        return (100.0 * searched / free) if free else 0.0
+
+    def _coverage_pct(self):
+        """Human-readable coverage figure for the completion log."""
+        cov = self.coverage_msg
+        if cov is None:
+            return 'coverage n/a'
+        searched = sum(1 for v in cov.data if v == 100)
+        free = sum(1 for v in cov.data if v in (0, 100))
+        unsearched = free - searched
+        pct = (100 * searched / free) if free else 0
+        return (f'{searched}/{free} cells searched = {pct:.0f}% '
+                f'({unsearched} cell(s) unreachable/unmarkable)')
 
     def _read_pose(self):
         """Drone position in the MAP frame. Time() = latest available, which
@@ -420,7 +456,8 @@ class FrontierExplorer(Node):
         # cells (point the camera at mapped-but-unseen areas). The drone only
         # finishes when BOTH are exhausted -> the whole reachable arena is both
         # mapped AND searched.
-        cands = self._candidates(clusters) + self._coverage_candidates()
+        frontier_cands = self._candidates(clusters)
+        cands = frontier_cands + self._coverage_candidates()
         cands.sort(key=lambda c: c[0])
         # Local-first sweep: if anything is within sweep_radius, drop the far
         # ones so the drone finishes its neighbourhood before a long (SLAM-
@@ -428,6 +465,24 @@ class FrontierExplorer(Node):
         near = [c for c in cands if c[4] <= self.sweep_radius]
         if near:
             cands = near
+
+        # Track the coverage high-water mark and when it last improved (for the
+        # plateau test below).
+        frac = self._coverage_frac()
+        now = self.get_clock().now()
+        if frac is not None and frac > self._best_frac + 0.5:
+            self._best_frac = frac
+            self._best_frac_time = now
+
+        # Search-done: arena fully MAPPED (no frontiers) AND either coverage is
+        # high or it has plateaued. Then stop chasing the last unmarkable cells
+        # and return home.
+        if not self.returning and not frontier_cands and frac is not None:
+            stalled = (self._best_frac_time is not None and
+                       (now - self._best_frac_time).nanoseconds / 1e9
+                       > self.coverage_stall_sec)
+            if frac >= self.coverage_complete_pct or stalled:
+                cands = []          # fall through to the return-to-entry path
 
         if not cands:
             # Might just be a transient (a single cycle with no cluster big
@@ -442,7 +497,8 @@ class FrontierExplorer(Node):
             if not self.returning:
                 self.returning = True
                 self.get_logger().info(
-                    f'No frontiers for {self.empty_count} cycles -> maze mapped, '
+                    f'No reachable frontier or unsearched cell for '
+                    f'{self.empty_count} cycles -> search done ({self._coverage_pct()}), '
                     'returning to entry/exit point')
             self.goal = self.entry_xy
             self._request_path(self.entry_xy[0], self.entry_xy[1], 0, 0.0, 0)
@@ -506,11 +562,17 @@ class FrontierExplorer(Node):
         path = future.result().result.path
         wx, wy, size, dist, ncand = self._last_goal
         if not path.poses:
+            # No path == the goal is UNREACHABLE (commonly a phantom coverage
+            # cell: a 1 m grid cell that clips a thin wall gets misclassified as
+            # free but can never be flown to). Strike it hard (2 at once) so two
+            # no-paths retire it instead of grinding 3x45 s timeouts -- otherwise
+            # dozens of phantom cells stall the whole mission below 100%.
             k = self._key((wx, wy))
-            self.blacklist[k] = self.blacklist.get(k, 0) + 1
-            what = 'entry point' if self.returning else f'frontier ({wx:.2f}, {wy:.2f})'
+            self.blacklist[k] = self.blacklist.get(k, 0) + 2
+            what = 'entry point' if self.returning else f'goal ({wx:.2f}, {wy:.2f})'
             self.get_logger().warn(
-                f'No path to {what} (failures={self.blacklist[k]}) -> reselecting')
+                f'No path to {what} (unreachable, strikes={self.blacklist[k]}) '
+                '-> reselecting')
             self.goal = None
             return
         if self.returning:
