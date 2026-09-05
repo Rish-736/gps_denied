@@ -131,6 +131,14 @@ class FrontierExplorer(Node):
         self.declare_parameter('arena_max_x', 6.0)
         self.declare_parameter('arena_min_y', -1.0)
         self.declare_parameter('arena_max_y', 13.5)
+        # A frontier whose cell sits within this margin of the arena boundary is
+        # a PHANTOM: free cells hugging a boundary wall, touching the walled-off
+        # unknown OUTSIDE the maze (most often the open ground seen through the
+        # entry gap). It can never be cleared -- the wall blocks the LiDAR -- so
+        # if it stays a candidate the endgame flip-flops and the drone oscillates
+        # against the wall until it clips it. Excluding it lets "no real frontiers
+        # left" actually become true so the mission can finish and return.
+        self.declare_parameter('boundary_margin', 0.5)
 
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('body_frame', 'base_link')
@@ -146,6 +154,7 @@ class FrontierExplorer(Node):
         self.max_failures = g('blacklist_after_failures')
         self.min_x, self.max_x = g('arena_min_x'), g('arena_max_x')
         self.min_y, self.max_y = g('arena_min_y'), g('arena_max_y')
+        self.boundary_margin = g('boundary_margin')
         self.map_frame, self.body_frame = g('map_frame'), g('body_frame')
         self.visit_cell = g('visit_cell_size')
         self.visit_weight = g('visit_weight')
@@ -169,6 +178,7 @@ class FrontierExplorer(Node):
         self.blacklist = {}             # rounded (x, y) -> consecutive failures
         self.entry_xy = None
         self.returning = False
+        self._return_committed = False   # once True, always go home (no flip-flop)
         self.mission_done = False
         self._waiting = 0
         self.visited = {}               # coarse cell -> visit count (the "memory")
@@ -341,6 +351,10 @@ class FrontierExplorer(Node):
             if not (self.min_x <= wx <= self.max_x
                     and self.min_y <= wy <= self.max_y):
                 continue        # outside the maze (open field beyond the entry)
+            m = self.boundary_margin
+            if (wx - self.min_x < m or self.max_x - wx < m
+                    or wy - self.min_y < m or self.max_y - wy < m):
+                continue        # boundary phantom (touches walled-off outside)
             if self.blacklist.get(self._key((wx, wy)), 0) >= self.max_failures:
                 continue        # repeatedly unreachable
             dist = math.hypot(wx - self.px, wy - self.py)
@@ -474,6 +488,32 @@ class FrontierExplorer(Node):
             self._best_frac = frac
             self._best_frac_time = now
 
+        # COMMIT-TO-RETURN latch. Once the whole arena is searched, go home and
+        # STAY going home. Without this the endgame flip-flops: a phantom frontier
+        # hugging a boundary wall (free cells touching the walled-off unknown
+        # OUTSIDE the maze -- it can never be cleared) keeps re-appearing as the
+        # drone backs away from it, dragging it out of 'returning' and back to
+        # chasing it. The drone then oscillates against the boundary wall until it
+        # clips it and tumbles (observed: 100% coverage, then a wall-crash with no
+        # SLAM loss). At full coverage there is nothing left to search, so any
+        # lingering frontier is a phantom -- ignore them all and fly the entry.
+        # Guarded by 'not frontier_cands' (map fully expanded -- only phantoms,
+        # now excluded, would remain) so an EARLY coverage spike, when only a few
+        # cells are mapped and all happen to be searched, can't send the drone
+        # home before the maze is actually explored.
+        if (not self._return_committed and not frontier_cands
+                and self.entry_xy is not None
+                and frac is not None and frac >= self.coverage_complete_pct):
+            self._return_committed = True
+            self.returning = True
+            self.get_logger().info(
+                f'Coverage complete ({self._coverage_pct()}) -> committing to '
+                'RETURN (ignoring any boundary phantom frontiers)')
+        if self._return_committed:
+            self.goal = self.entry_xy
+            self._request_path(self.entry_xy[0], self.entry_xy[1], 0, 0.0, 0)
+            return
+
         # Search-done: arena fully MAPPED (no frontiers) AND either coverage is
         # high or it has plateaued. Then stop chasing the last unmarkable cells
         # and return home.
@@ -496,6 +536,7 @@ class FrontierExplorer(Node):
                 return
             if not self.returning:
                 self.returning = True
+                self._return_committed = True   # latch: no flip-flop back out
                 self.get_logger().info(
                     f'No reachable frontier or unsearched cell for '
                     f'{self.empty_count} cycles -> search done ({self._coverage_pct()}), '

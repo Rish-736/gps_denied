@@ -109,16 +109,33 @@ TRAJECTORY_BUILDER_2D.submaps.num_range_data = 120
 -- The arena is only ~15 m, so local scan matching + IMU already give good
 -- odometry; we don't need aggressive global loop closure, and its downside
 -- (catastrophic wrong snaps) is far worse than a little uncorrected drift.
-POSE_GRAPH.constraint_builder.min_score = 0.72
-POSE_GRAPH.constraint_builder.global_localization_min_score = 0.80
-POSE_GRAPH.constraint_builder.max_constraint_distance = 9.
-POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 4.
-POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(20.)
+-- TIGHTENED FURTHER for the uniform 2.0m-corridor NIDAR maze. A perfectly
+-- regular grid of identical 2m cells is the worst possible case for scan
+-- aliasing: every junction looks like every other junction. In the last full
+-- run local matching held rock-solid for ~250s, then a WRONG loop closure
+-- snapped the pose during the return traverse over already-mapped territory and
+-- tumbled the drone. Since the arena is tiny and the flight slow, we lean almost
+-- entirely on local scan-matching + IMU (whose drift over ~4 min is centimetres)
+-- and accept only very high-confidence, nearby loop closures.
+POSE_GRAPH.constraint_builder.min_score = 0.78              -- was 0.72
+POSE_GRAPH.constraint_builder.global_localization_min_score = 0.85  -- was 0.80
+POSE_GRAPH.constraint_builder.max_constraint_distance = 5.  -- was 9. (nearby only)
+POSE_GRAPH.constraint_builder.sampling_ratio = 0.2          -- test fewer candidate constraints
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 3.   -- was 4.
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(15.)  -- was 20
 
--- Every optimisation pass shifts submaps, which is what you SEE as the map
--- jumping. With the motion filter fixed above, nodes accumulate at a sane rate,
--- so the default cadence is no longer constant. Raise this if it still jumps
--- too often (costs some drift correction); lower it for tighter accuracy.
+-- Loop closure RE-ENABLED but conservative. We learned the hard way that a
+-- perfectly uniform grid (identical corridor scans everywhere) makes the pose
+-- graph snap to the wrong corridor -> crash; disabling optimisation entirely
+-- stopped the snaps but let local drift smear the map and seal off half the
+-- maze (incomplete search). The real fix is the ENVIRONMENT: the maze now has
+-- rooms + loops (distinctive geometry), which is both more realistic and gives
+-- the pose graph unambiguous features to close loops on. With that, conservative
+-- loop closure (high min_score, nearby-only) corrects drift without the
+-- catastrophic wrong snaps -> complete map AND stable pose. The tighter
+-- divergence guard in vision_pose_bridge (max_slam_speed 1.2, just above the
+-- drone's real 0.6 m/s) is the backstop: any residual snap is caught in a few
+-- frames and the drone hovers/lands instead of flying away.
 POSE_GRAPH.optimize_every_n_nodes = 90
 
 return options

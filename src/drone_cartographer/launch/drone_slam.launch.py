@@ -139,9 +139,19 @@ def launch_setup(context, *args, **kwargs):
     # position (vision_pose_bridge), watch it against a local geofence
     # (geofence_monitor), and run the mission timer/entry-point memory
     # (mission_fsm). See docs/mission_rules_crucial_risks.md #1/#3/#5/#6.
+    arena = [
+        '-p', ['arena_min_x:=', LaunchConfiguration('arena_min_x')],
+        '-p', ['arena_max_x:=', LaunchConfiguration('arena_max_x')],
+        '-p', ['arena_min_y:=', LaunchConfiguration('arena_min_y')],
+        '-p', ['arena_max_y:=', LaunchConfiguration('arena_max_y')],
+    ]
     for script in ('vision_pose_bridge.py', 'geofence_monitor.py', 'mission_fsm.py'):
+        # The geofence needs the arena rectangle so it doesn't false-trip on the
+        # far half of an edge-entry maze; the others take no extra args.
+        extra = arena if script == 'geofence_monitor.py' else []
         nodes.append(ExecuteProcess(
-            cmd=['python3', os.path.join(SCRIPTS_DIR, script)],
+            cmd=['python3', os.path.join(SCRIPTS_DIR, script), '--ros-args', *extra]
+                if extra else ['python3', os.path.join(SCRIPTS_DIR, script)],
             name=script,
             output='screen',
             condition=IfCondition(use_mavros),
@@ -157,5 +167,11 @@ def generate_launch_description():
                               description='Launch rviz2 with the preset config'),
         DeclareLaunchArgument('mavros', default_value='false',
                               description='Also launch MAVROS for flight control'),
+        # Arena rectangle (map frame) for the geofence. Defaults match the
+        # 2.0m-corridor nidar_sim maze x[-7,7] y[-1,13].
+        DeclareLaunchArgument('arena_min_x', default_value='-7.0'),
+        DeclareLaunchArgument('arena_max_x', default_value='7.0'),
+        DeclareLaunchArgument('arena_min_y', default_value='-1.0'),
+        DeclareLaunchArgument('arena_max_y', default_value='13.0'),
         OpaqueFunction(function=launch_setup),
     ])

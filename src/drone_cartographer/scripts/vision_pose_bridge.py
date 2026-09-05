@@ -49,11 +49,21 @@ class VisionPoseBridge(Node):
         # even when frozen (the last transform stays available), so freshness has
         # to be judged from the transform's own timestamp, not from the lookup.
         self.declare_parameter('stale_timeout_sec', 0.5)
-        # Divergence: a SLAM pose sliding faster than the drone can fly means
-        # Cartographer has lost tracking. Our hard ceiling is ~1.5 m/s, so 2.5
-        # leaves headroom for honest fast frames while still catching a runaway.
-        self.declare_parameter('max_slam_speed', 2.5)
+        # Divergence: a SLAM pose sliding faster than the drone can physically
+        # fly means Cartographer has lost tracking. The drone's hard speed cap is
+        # MPC_XY_VEL_MAX = 0.6 m/s, so legitimate map motion is <=0.6 m/s. Set
+        # the threshold to 1.2 (2x real speed) -- tight enough to catch the ~1 m/s
+        # WRONG-loop-closure drift that eased in under the old 2.5 ceiling and
+        # crashed a run, loose enough never to trip on honest motion.
+        self.declare_parameter('max_slam_speed', 1.2)
         self.declare_parameter('diverge_frames', 5)
+        # Recovery hysteresis. FAIL FAST, RECOVER SLOW. A handful of bad frames
+        # marks SLAM lost immediately; coming BACK requires this many CONSECUTIVE
+        # good frames. Without it the loss flag flaps (lost->OK->lost every frame)
+        # when the pose is jittering, and each "OK" resumes the vision feed and
+        # steps PX4's EKF -> attitude spike -> tumble. That flap is exactly what
+        # crashed the return leg. ~12 frames @ 30Hz = 0.4s of clean tracking.
+        self.declare_parameter('recover_frames', 12)
 
         self.map_frame = self.get_parameter('map_frame').value
         self.body_frame = self.get_parameter('body_frame').value
@@ -62,6 +72,7 @@ class VisionPoseBridge(Node):
         self.stale_timeout = self.get_parameter('stale_timeout_sec').value
         self.max_slam_speed = self.get_parameter('max_slam_speed').value
         self.diverge_frames = self.get_parameter('diverge_frames').value
+        self.recover_frames = self.get_parameter('recover_frames').value
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -77,6 +88,7 @@ class VisionPoseBridge(Node):
         self._last_xyz = None       # last accepted position, for jump rejection
         self._last_xyz_wall = self.get_clock().now()
         self._diverge_count = 0     # consecutive implausible-speed frames
+        self._recover_count = 0     # consecutive good frames since a loss
         self._last_stamp_ns = None  # last TF stamp, to detect a frozen SLAM pose
         self._stamp_changed_wall = self.get_clock().now()
         self._slam_ok = None        # tri-state so the first result always logs
@@ -115,8 +127,52 @@ class VisionPoseBridge(Node):
             self._stamp_changed_wall = now
         stale_for = (now - self._stamp_changed_wall).nanoseconds / 1e9
         if self._last_stamp_ns is not None and stale_for > self.stale_timeout:
+            self._recover_count = 0
             self._set_slam_ok(False)
             return                  # do NOT feed PX4 a frozen pose
+
+        x = tf.transform.translation.x
+        y = tf.transform.translation.y
+        z = tf.transform.translation.z
+
+        # PLAUSIBILITY guard. The freeze check above catches a stuck pose; this
+        # catches the OTHER failure we saw -- the SLAM pose sliding/snapping away
+        # (Cartographer mis-matching in the maze's look-alike corridors). Judge
+        # each frame by how far the pose moved since the last GOOD one: a single
+        # step over max_jump, or a sustained speed over max_slam_speed, is
+        # physically impossible for our slow drone and means SLAM lost the plot.
+        #
+        # Key discipline that stops the flap-crash: an implausible frame is NEVER
+        # published and NEVER re-anchors _last_xyz, so a persistent wrong snap
+        # keeps failing (-> the follower hovers, then lands) instead of being fed
+        # to PX4. slam_ok only goes back True after recover_frames CONSECUTIVE
+        # good frames -- fail fast, recover slow -- so it can't oscillate
+        # lost<->OK and step the EKF on every "resume".
+        now_wall = self.get_clock().now()
+        plausible = True
+        if self._last_xyz is not None:
+            step = math.dist((x, y, z), self._last_xyz)
+            dt = (now_wall - self._last_xyz_wall).nanoseconds / 1e9
+            speed = step / dt if dt > 1e-3 else 0.0
+            if step > self.max_jump or speed > self.max_slam_speed:
+                plausible = False
+
+        if not plausible:
+            self._diverge_count += 1
+            self._recover_count = 0
+            if self._diverge_count >= self.diverge_frames:
+                self._set_slam_ok(False)   # sustained -> declare lost, hover/land
+            return                         # never feed PX4 an implausible pose
+        self._diverge_count = 0
+        self._last_xyz = (x, y, z)         # re-anchor only on a good frame
+        self._last_xyz_wall = now_wall
+
+        # Good frame. If we were lost, require a sustained clean streak before
+        # resuming the feed, so a lone good frame can't restart the flap.
+        if self._slam_ok is not True:
+            self._recover_count += 1
+            if self._recover_count < self.recover_frames:
+                return
         self._set_slam_ok(True)
 
         msg = PoseStamped()
@@ -129,36 +185,6 @@ class VisionPoseBridge(Node):
         # aligns with what MAVROS/PX4 expect. EKF2_EV_DELAY absorbs the small
         # latency. On real hardware there is no sim/wall split, so this is also
         # correct there.
-        x = tf.transform.translation.x
-        y = tf.transform.translation.y
-        z = tf.transform.translation.z
-
-        # DIVERGENCE guard. The freeze check above catches a stuck pose; this
-        # catches the OTHER failure we saw -- the SLAM pose sliding away at an
-        # impossible speed (Cartographer mis-matching in the maze's look-alike
-        # corridors). A single teleport trips max_jump; a sustained implausible
-        # velocity (faster than the drone can physically fly) means SLAM has lost
-        # the plot, so we stop feeding PX4 and hover. Counted over consecutive
-        # frames so one noisy sample doesn't false-trip.
-        now_wall = self.get_clock().now()
-        if self._last_xyz is not None:
-            jump = math.dist((x, y, z), self._last_xyz)
-            dt = (now_wall - self._last_xyz_wall).nanoseconds / 1e9
-            speed = jump / dt if dt > 1e-3 else 0.0
-            if jump > self.max_jump:
-                self.get_logger().warn(
-                    f'Skipping {jump:.2f}m pose jump (SLAM glitch) to protect EKF')
-                return
-            if speed > self.max_slam_speed:
-                self._diverge_count += 1
-                if self._diverge_count >= self.diverge_frames:
-                    self._set_slam_ok(False)
-                    return          # SLAM diverging -> do not feed PX4
-            else:
-                self._diverge_count = 0
-        self._last_xyz = (x, y, z)
-        self._last_xyz_wall = now_wall
-
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
         msg.pose.position.x = x
