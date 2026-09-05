@@ -250,6 +250,10 @@ class PathFollowerPosition(Node):
         # it even if it fires just before we subscribe.
         self.create_subscription(
             Bool, '/mission/complete', self._on_mission_complete, latched)
+        # Safety LAND-NOW (mission_fsm): operator emergency stop or critical
+        # battery -> AUTO.LAND immediately, wherever we are. Latched.
+        self.create_subscription(
+            Bool, '/mission/land_now', self._on_land_now, latched)
         self.sp_pub = self.create_publisher(
             PoseStamped, '/mavros/setpoint_position/local', 10)
         self.reached_pub = self.create_publisher(Bool, '/path_follower/reached', 10)
@@ -535,6 +539,13 @@ class PathFollowerPosition(Node):
         and not already landing."""
         if msg.data and self.airborne and not self.landing:
             self._commit_land(reason='Mission complete (returned to entry)')
+
+    def _on_land_now(self, msg):
+        """Safety failsafe (mission_fsm): emergency stop or critical battery ->
+        AUTO.LAND immediately, no matter where we are. Fires even if not yet
+        'airborne' by our own flag, since an abort must always bring it down."""
+        if msg.data and not self.landing:
+            self._commit_land(reason='SAFETY LAND-NOW (abort / critical battery)')
 
     def _commit_land(self, reason=None):
         """Ask PX4 to land where it is. AUTO.LAND descends on baro and needs no

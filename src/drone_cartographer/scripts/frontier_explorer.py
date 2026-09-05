@@ -204,6 +204,16 @@ class FrontierExplorer(Node):
             OccupancyGrid, '/coverage_grid', self._on_coverage, map_qos)
         self.create_subscription(
             Bool, '/path_follower/reached', self._on_reached, 10)
+        # Safety RECALL (mission_fsm): geofence breach, C2-link loss, low battery,
+        # time budget, or operator recall -> abandon exploration and fly home NOW.
+        # Reuses the normal return-to-entry path; on arrival /mission/complete
+        # lands the drone. Latched so a recall issued before we subscribe is caught.
+        recall_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.create_subscription(
+            Bool, '/mission/recall', self._on_recall, recall_qos)
         self.marker_pub = self.create_publisher(MarkerArray, '/frontiers', 5)
         self.path_pub = self.create_publisher(Path, '/planned_path', 10)
         # Latched: tells the follower the mission is over (back at entry) so it
@@ -283,6 +293,15 @@ class FrontierExplorer(Node):
             for dy in range(-r, r + 1):
                 count += self.visited.get((cx + dx, cy + dy), 0)
         return self.visit_weight * min(count, 20)   # cap so it never dominates
+
+    def _on_recall(self, msg):
+        """Safety failsafe: stop exploring and commit to returning home now."""
+        if msg.data and not self._return_committed:
+            self._return_committed = True
+            self.returning = True
+            self.goal = None
+            self.get_logger().warn(
+                'SAFETY RECALL received -> abandoning exploration, returning to entry')
 
     def _on_reached(self, msg):
         if not (msg.data and self.goal is not None):
@@ -519,7 +538,7 @@ class FrontierExplorer(Node):
             self.get_logger().info(
                 f'Coverage complete ({self._coverage_pct()}) -> committing to '
                 'RETURN (ignoring any boundary phantom frontiers)')
-        if self._return_committed:
+        if self._return_committed and self.entry_xy is not None:
             self.goal = self.entry_xy
             self._request_path(self.entry_xy[0], self.entry_xy[1], 0, 0.0, 0)
             return
