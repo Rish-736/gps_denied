@@ -128,20 +128,23 @@ def generate_launch_description():
         DeclareLaunchArgument('cell_size', default_value='1.0',
                               description='Coverage & survivor-report grid cell size (m)'),
         # --- Wall-avoidance / smoothing tuning knobs (the "threshold values") ---
-        # Defaults are set for ~1.2 m spec corridors: repulsion_max MUST stay well
-        # under the corridor half-width (0.6 m here) or a push off one wall
-        # overshoots into the other and the drone wobbles wall-to-wall.
+        # Softened for smooth 2.0m-corridor flight: with the planner routing paths
+        # down corridor centres (nav2 inflation 0.40), repulsion only needs to
+        # nudge when the drone is GENUINELY near a wall, so influence is low
+        # (no constant both-walls push that made it dart side to side) and the
+        # max shift is small. repulsion_max MUST stay well under the corridor
+        # half-width (1.0 m here) or a push off one wall overshoots into the other.
         DeclareLaunchArgument('robot_radius', default_value='0.40',
                               description='True x500 prop-tip radius the repulsion protects (m)'),
-        DeclareLaunchArgument('repulsion_influence', default_value='0.9',
+        DeclareLaunchArgument('repulsion_influence', default_value='0.6',
                               description='Start pushing when a wall is closer than this (m, from prop tips)'),
-        DeclareLaunchArgument('repulsion_gain', default_value='0.5',
+        DeclareLaunchArgument('repulsion_gain', default_value='0.4',
                               description='How hard to push off walls (higher = stronger)'),
-        DeclareLaunchArgument('repulsion_max', default_value='0.35',
+        DeclareLaunchArgument('repulsion_max', default_value='0.25',
                               description='Max sideways shift (m); keep << corridor half-width'),
         DeclareLaunchArgument('brake_distance', default_value='0.55',
                               description='Hard-stop if a wall is closer than this ahead (m)'),
-        DeclareLaunchArgument('setpoint_lpf', default_value='0.35',
+        DeclareLaunchArgument('setpoint_lpf', default_value='0.25',
                               description='Position smoothing 0..1 (lower = smoother, laggier)'),
         DeclareLaunchArgument('yaw_lpf', default_value='0.20',
                               description='Yaw smoothing 0..1 (lower = smoother)'),

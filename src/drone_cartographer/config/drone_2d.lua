@@ -124,18 +124,18 @@ POSE_GRAPH.constraint_builder.sampling_ratio = 0.2          -- test fewer candid
 POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 3.   -- was 4.
 POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(15.)  -- was 20
 
--- Loop closure RE-ENABLED but conservative. We learned the hard way that a
--- perfectly uniform grid (identical corridor scans everywhere) makes the pose
--- graph snap to the wrong corridor -> crash; disabling optimisation entirely
--- stopped the snaps but let local drift smear the map and seal off half the
--- maze (incomplete search). The real fix is the ENVIRONMENT: the maze now has
--- rooms + loops (distinctive geometry), which is both more realistic and gives
--- the pose graph unambiguous features to close loops on. With that, conservative
--- loop closure (high min_score, nearby-only) corrects drift without the
--- catastrophic wrong snaps -> complete map AND stable pose. The tighter
--- divergence guard in vision_pose_bridge (max_slam_speed 1.2, just above the
--- drone's real 0.6 m/s) is the backstop: any residual snap is caught in a few
--- frames and the drone hovers/lands instead of flying away.
-POSE_GRAPH.optimize_every_n_nodes = 90
+-- GLOBAL LOOP CLOSURE DISABLED (local SLAM + IMU only). Long debugging showed
+-- global optimisation is the recurring crash cause here: even in the varied maze
+-- the pose graph still occasionally makes a WRONG loop closure and oscillates
+-- the map ~0.5 m back and forth (offset seen bouncing 0.01<->0.67 m, 3 SLAM
+-- losses), which lurches the drone into a tumble -- and it bites hardest on the
+-- long, thorough far-corner search we actually want. In a small 14 m arena on a
+-- short (~4 min) slow flight, local scan-matching + IMU drift is small, and the
+-- varied (rooms+loops) maze gives strong local features, so we do NOT need
+-- global loop closure and its catastrophic downside. Setting the optimise
+-- cadence above a whole run's node count means optimisation never fires: pure,
+-- snap-free local SLAM. (On real feature-rich hardware, loop closure can be
+-- revisited; it is the perfectly-repeatable sim geometry that makes it toxic.)
+POSE_GRAPH.optimize_every_n_nodes = 100000
 
 return options

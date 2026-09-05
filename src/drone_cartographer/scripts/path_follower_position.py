@@ -245,6 +245,11 @@ class PathFollowerPosition(Node):
         self.create_subscription(Bool, '/slam_ok', self._on_slam_ok, latched)
         self.create_subscription(
             OccupancyGrid, '/coverage_grid', self._on_coverage, latched)
+        # Mission complete (explorer has returned to the entry): land & disarm at
+        # the entry point instead of hovering there forever. Latched so we catch
+        # it even if it fires just before we subscribe.
+        self.create_subscription(
+            Bool, '/mission/complete', self._on_mission_complete, latched)
         self.sp_pub = self.create_publisher(
             PoseStamped, '/mavros/setpoint_position/local', 10)
         self.reached_pub = self.create_publisher(Bool, '/path_follower/reached', 10)
@@ -524,14 +529,23 @@ class PathFollowerPosition(Node):
             yaw = math.atan2(ty - self.my, tx - self.mx)
         return tx, ty, yaw
 
-    def _commit_land(self):
-        """SLAM is gone for good -> ask PX4 to land where it is. AUTO.LAND
-        descends on baro and needs no position estimate, so it works even with a
-        diverged EKF. Latched so we only fire once."""
+    def _on_mission_complete(self, msg):
+        """Explorer signalled the mission is done (back at the entry). Land and
+        disarm here rather than hovering. Only act once we're actually airborne
+        and not already landing."""
+        if msg.data and self.airborne and not self.landing:
+            self._commit_land(reason='Mission complete (returned to entry)')
+
+    def _commit_land(self, reason=None):
+        """Ask PX4 to land where it is. AUTO.LAND descends on baro and needs no
+        position estimate, so it works even with a diverged EKF. Latched so we
+        only fire once. Used both for the SLAM-loss failsafe and for the normal
+        end-of-mission landing at the entry point."""
         self.landing = True
-        self.get_logger().error(
-            f'SLAM not recovered in {self.land_after:.0f}s -> commanding AUTO.LAND '
-            '(safe descent)')
+        if reason is None:
+            reason = f'SLAM not recovered in {self.land_after:.0f}s'
+        self.get_logger().warn(
+            f'{reason} -> commanding AUTO.LAND (descend & disarm at current spot)')
         if self.mode_cli.service_is_ready():
             req = SetMode.Request()
             req.custom_mode = 'AUTO.LAND'

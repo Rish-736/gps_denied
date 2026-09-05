@@ -206,6 +206,15 @@ class FrontierExplorer(Node):
             Bool, '/path_follower/reached', self._on_reached, 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/frontiers', 5)
         self.path_pub = self.create_publisher(Path, '/planned_path', 10)
+        # Latched: tells the follower the mission is over (back at entry) so it
+        # LANDS instead of hovering. Latched so the follower gets it even if it
+        # is briefly not subscribed at the moment we finish.
+        complete_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.complete_pub = self.create_publisher(
+            Bool, '/mission/complete', complete_qos)
         self.planner = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
         self.create_timer(g('replan_period_sec'), self._tick)
@@ -280,9 +289,10 @@ class FrontierExplorer(Node):
             return
         if self.returning:
             self.mission_done = True
+            self.complete_pub.publish(Bool(data=True))   # -> follower lands
             self.get_logger().info(
                 'Returned to entry/exit point -- MISSION COMPLETE '
-                '(maze explored and exited).')
+                '(maze explored and exited). Signalling follower to LAND.')
         else:
             self.get_logger().info('Frontier reached -> selecting next')
             self.blacklist.pop(self._key(self.goal), None)

@@ -70,9 +70,9 @@ ros2 launch ~/nidar_ws/src/drone_cartographer/launch/drone_explore.launch.py \
   cell_size:=2.0 \
   lookahead:=0.4 \
   robot_radius:=0.40 \
-  repulsion_influence:=0.9 repulsion_gain:=0.5 repulsion_max:=0.35 \
+  repulsion_influence:=0.6 repulsion_gain:=0.4 repulsion_max:=0.25 \
   brake_distance:=0.55 \
-  setpoint_lpf:=0.35 yaw_lpf:=0.20 &
+  setpoint_lpf:=0.25 yaw_lpf:=0.20 &
 
 echo ">> ALL UP. Watch Gazebo (drone) + RViz (live map). Ctrl-C here to stop everything."
 wait

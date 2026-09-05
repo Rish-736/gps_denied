@@ -68,12 +68,16 @@ class CoverageTracker(Node):
         self.declare_parameter('arena_min_y', -1.0)
         self.declare_parameter('arena_max_y', 13.5)
         self.declare_parameter('cell_size', 1.0)
-        # Camera model used to decide when a cell counts as searched. Set these
-        # to the REAL camera once integrated. FOV around the drone heading; a
-        # forward-ish cone forces the drone to actually face each area instead of
-        # ticking cells off just by being near them.
-        self.declare_parameter('camera_range', 4.0)
-        self.declare_parameter('camera_fov_deg', 140.0)
+        # Camera model used to decide when a cell counts as SEARCHED (i.e. a
+        # survivor there would have been seen). These MUST be set to the real
+        # camera's usable HUMAN-DETECTION range and FOV once it is chosen -- not
+        # the lens's raw spec, but the distance/angle at which the detector
+        # reliably recognises a person. Deliberately conservative defaults
+        # (3.0 m / 100 deg, down from a generous 4.0/140): a tighter cone forces
+        # the drone to actually approach and face each area rather than ticking
+        # cells off from far down a corridor -> a genuinely thorough search.
+        self.declare_parameter('camera_range', 3.0)
+        self.declare_parameter('camera_fov_deg', 100.0)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('body_frame', 'base_link')
         self.declare_parameter('update_rate_hz', 4.0)
