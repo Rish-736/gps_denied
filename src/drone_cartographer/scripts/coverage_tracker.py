@@ -73,10 +73,13 @@ class CoverageTracker(Node):
         # camera's usable HUMAN-DETECTION range and FOV once it is chosen -- not
         # the lens's raw spec, but the distance/angle at which the detector
         # reliably recognises a person. Deliberately conservative defaults
-        # (3.0 m / 100 deg, down from a generous 4.0/140): a tighter cone forces
-        # the drone to actually approach and face each area rather than ticking
-        # cells off from far down a corridor -> a genuinely thorough search.
-        self.declare_parameter('camera_range', 3.0)
+        # (2.0 m / 100 deg, down from a generous 4.0/140). With 2 m maze cells, a
+        # 2 m range means a cell only counts as searched once the drone is within
+        # ~one cell of it AND facing it with line of sight -- so it must
+        # physically traverse into every region, CORNERS included, instead of
+        # ticking far cells off from down a corridor. This is what makes "go to
+        # every corner so no survivor is missed" actually true.
+        self.declare_parameter('camera_range', 2.0)
         self.declare_parameter('camera_fov_deg', 100.0)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('body_frame', 'base_link')
